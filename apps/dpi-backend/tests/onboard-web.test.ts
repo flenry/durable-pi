@@ -1,14 +1,53 @@
 import assert from "node:assert/strict";
-import { execFile as nodeExecFile, type ChildProcess, spawn } from "node:child_process";
-import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
+import { EventEmitter, once } from "node:events";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { PassThrough } from "node:stream";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { WebExtensionOptions, WebFetch, WebLookup, WebResponse } from "../src/onboard/web.js";
 import { createWebExtension } from "../src/onboard/web.js";
 
 const publicLookup: WebLookup = async () => [{ address: "93.184.216.34", family: 4 }];
+
+function fakeSearchChild(options: {
+  stdout?: string;
+  stderr?: string;
+  error?: Error;
+  close?: boolean;
+  onKill?: (signal: string) => void;
+} = {}): ChildProcess {
+  const child = new EventEmitter() as unknown as ChildProcess;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  Object.assign(child, {
+    pid: undefined,
+    exitCode: null,
+    signalCode: null,
+    stdin: null,
+    stdout,
+    stderr,
+    kill: (signal: string) => {
+      options.onKill?.(signal);
+      return true;
+    },
+  });
+  if (options.close !== false) {
+    setImmediate(() => {
+      if (options.error) {
+        child.emit("error", options.error);
+        child.emit("close", -2, null);
+        return;
+      }
+      const pipesClosed = Promise.all([once(stdout, "close"), once(stderr, "close")]);
+      stdout.end(options.stdout ?? "");
+      stderr.end(options.stderr ?? "");
+      void pipesClosed.then(() => child.emit("close", 0, null));
+    });
+  }
+  return child;
+}
 const createTestWebExtension = (options: WebExtensionOptions = {}) => createWebExtension({ lookup: publicLookup, ...options });
 
 function response(
@@ -69,22 +108,20 @@ async function createSigtermIgnoringFixture() {
   let resolveSpawned!: () => void;
   const spawned = new Promise<void>((resolve) => { resolveSpawned = resolve; });
   let exited: Promise<unknown[]> | undefined;
-  const execFile = ((command: string, _args: readonly string[], options: Record<string, unknown>, callback: (...args: never[]) => void) => {
+  const spawnSearch = ((command: string, _args: readonly string[], options: Record<string, unknown>) => {
     assert.equal(command, "mcporter");
-    child = nodeExecFile(process.execPath, [fixturePath], {
-      encoding: "utf8",
-      maxBuffer: Number(options.maxBuffer),
+    child = nodeSpawn(process.execPath, [fixturePath], {
+      detached: options.detached === true,
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
-      ...(typeof options.timeout === "number" ? { timeout: options.timeout } : {}),
-      ...(options.signal instanceof AbortSignal ? { signal: options.signal } : {}),
-    }, callback as never);
+    });
     child.once("spawn", resolveSpawned);
     exited = once(child, "close");
     return child;
   }) as never;
 
   return {
-    execFile,
+    spawn: spawnSearch,
     waitForSpawn: () => spawned,
     waitForExit: () => exited ?? Promise.resolve([]),
     cleanup: async () => {
@@ -93,6 +130,203 @@ async function createSigtermIgnoringFixture() {
       await rm(directory, { recursive: true, force: true });
     },
   };
+}
+
+async function createProcessTreeFixture() {
+  const directory = await mkdtemp(join(tmpdir(), "dpi-web-search-tree-"));
+  const fixturePath = join(directory, "spawn-grandchild.cjs");
+  const grandchildPidPath = join(directory, "grandchild.pid");
+  await writeFile(fixturePath, `
+    const { spawn } = require("node:child_process");
+    const { writeFileSync } = require("node:fs");
+    const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" });
+    writeFileSync(process.env.DPI_WEB_SEARCH_GRANDCHILD_PID_FILE, String(grandchild.pid));
+    process.on("SIGTERM", () => {});
+    setInterval(() => {}, 1000);
+  `);
+
+  let child: ChildProcess | undefined;
+  let resolveSpawned!: () => void;
+  const spawned = new Promise<void>((resolve) => { resolveSpawned = resolve; });
+  let stdoutClosed: Promise<unknown[]> | undefined;
+  let stderrClosed: Promise<unknown[]> | undefined;
+  let childClosed: Promise<unknown[]> | undefined;
+  const spawnSearch = ((command: string, _args: readonly string[], options: Record<string, unknown>) => {
+    assert.equal(command, "mcporter");
+    assert.equal(options.detached, process.platform !== "win32", "Unix invocations must own a detached process group");
+    child = nodeSpawn(process.execPath, [fixturePath], {
+      detached: options.detached === true,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      env: { ...process.env, DPI_WEB_SEARCH_GRANDCHILD_PID_FILE: grandchildPidPath },
+    });
+    child.once("spawn", resolveSpawned);
+    childClosed = once(child, "close");
+    if (child.stdout) stdoutClosed = once(child.stdout, "close");
+    if (child.stderr) stderrClosed = once(child.stderr, "close");
+    return child;
+  }) as never;
+
+  const waitForGrandchildPid = async () => {
+    const deadline = Date.now() + 1_000;
+    for (;;) {
+      try {
+        const pid = Number(await readFile(grandchildPidPath, "utf8"));
+        assert.ok(Number.isInteger(pid) && pid > 0);
+        return pid;
+      } catch (error) {
+        if (Date.now() >= deadline) throw new Error("grandchild fixture did not publish its pid", { cause: error });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+  };
+
+  return {
+    spawn: spawnSearch,
+    waitForSpawn: () => spawned,
+    waitForGrandchildPid,
+    waitForPipesClosed: async () => {
+      assert.ok(stdoutClosed && stderrClosed, "fixture stdout/stderr pipes should be owned");
+      await Promise.all([stdoutClosed, stderrClosed]);
+    },
+    get child() { return child; },
+    cleanup: async () => {
+      if (child?.pid && process.platform !== "win32") {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+      } else if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      if (childClosed) await within(childClosed, 1_000, "process-tree fixture did not close").catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 1_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    if (Date.now() >= deadline) throw new Error(`grandchild process ${pid} remained alive`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function assertSearchProcessTreeKilled(mode: "timeout" | "cancel") {
+  const fixture = await createProcessTreeFixture();
+  const unrelated = nodeSpawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: process.platform !== "win32",
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  const unrelatedClosed = once(unrelated, "close");
+  const controller = new AbortController();
+  try {
+    await within(once(unrelated, "spawn"), 1_000, `${mode} unrelated process did not spawn`);
+    const extension = createWebExtension({
+      searchTimeoutMs: mode === "timeout" ? 1_200 : 5_000,
+      spawn: fixture.spawn,
+    });
+    const pending = getTools(extension).webSearch.execute(
+      { query: "docs" } as never,
+      {} as never,
+      { abortSignal: mode === "cancel" ? controller.signal : undefined } as never,
+    );
+    await within(fixture.waitForSpawn(), 1_000, `${mode} fixture parent did not spawn`);
+    const grandchildPid = await fixture.waitForGrandchildPid();
+    if (mode === "cancel") controller.abort();
+
+    const result = await within(pending, 2_000, `web_search did not settle after ${mode}`);
+    assert.equal(result.isError, true);
+    assert.match(outputText(result), mode === "timeout" ? /timed out/i : /cancelled/i);
+    assert.ok(fixture.child);
+    assert.equal(fixture.child.stdout?.destroyed, true, `${mode} must destroy owned stdout`);
+    assert.equal(fixture.child.stderr?.destroyed, true, `${mode} must destroy owned stderr`);
+    assert.ok(unrelated.pid);
+    assert.doesNotThrow(() => process.kill(unrelated.pid!, 0), `${mode} must not kill an unrelated process group`);
+    await within(
+      Promise.all([fixture.waitForPipesClosed(), waitForProcessExit(grandchildPid)]),
+      2_000,
+      `${mode} must close inherited pipes and terminate the grandchild`,
+    );
+  } finally {
+    if (unrelated.pid && process.platform !== "win32") {
+      try { process.kill(-unrelated.pid, "SIGKILL"); } catch { /* already gone */ }
+    } else if (unrelated.exitCode === null && unrelated.signalCode === null) {
+      unrelated.kill("SIGKILL");
+    }
+    await within(unrelatedClosed, 1_000, `${mode} unrelated fixture did not exit`).catch(() => undefined);
+    await fixture.cleanup();
+  }
+}
+
+async function runIsolatedTitleProbe(contentType: "text/html" | "text/plain", raw: boolean, repeats: number) {
+  const moduleUrl = new URL("../src/onboard/web.ts", import.meta.url).href;
+  const script = `
+    import { createWebExtension } from ${JSON.stringify(moduleUrl)};
+    const contentType = process.env.DPI_TITLE_PROBE_CONTENT_TYPE;
+    const raw = process.env.DPI_TITLE_PROBE_RAW === "true";
+    const repeats = Number(process.env.DPI_TITLE_PROBE_REPEATS);
+    const source = "<title>".repeat(repeats);
+    let heartbeat = false;
+    setTimeout(() => { heartbeat = true; }, 10);
+    const extension = createWebExtension({
+      timeoutMs: 100,
+      maxResponseBytes: 5_000_000,
+      lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      fetch: async () => ({
+        status: 200,
+        headers: { "content-type": contentType },
+        body: (async function* () { yield Buffer.from(source); })(),
+      }),
+    });
+    const tool = extension.tools.find((item) => item.name === "fetch_url");
+    const started = Date.now();
+    const result = await tool.execute({ url: "https://public.example/adversarial-title", raw, no_cache: true }, {}, {});
+    const elapsedMs = Date.now() - started;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    console.log(JSON.stringify({
+      error: result.details?.error,
+      isError: result.isError,
+      heartbeat,
+      elapsedMs,
+      sourceBytes: Buffer.byteLength(source),
+      title: result.details?.title,
+    }));
+    if (result.isError || !heartbeat || result.details?.title !== "") process.exitCode = 1;
+  `;
+  const child = nodeSpawn(process.execPath, ["--import=tsx", "--input-type=module", "-e", script], {
+    env: {
+      ...process.env,
+      DPI_TITLE_PROBE_CONTENT_TYPE: contentType,
+      DPI_TITLE_PROBE_RAW: String(raw),
+      DPI_TITLE_PROBE_REPEATS: String(repeats),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+  const close = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
+  let watchdog: NodeJS.Timeout | undefined;
+  const exit = await Promise.race([
+    close,
+    new Promise<never>((_resolve, reject) => {
+      watchdog = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`isolated title probe stalled (${contentType}, raw=${raw})`));
+      }, 2_500);
+    }),
+  ]).finally(() => clearTimeout(watchdog));
+  assert.equal(exit[0], 0, `isolated title probe failed: ${stderr}\\n${stdout}`);
+  const line = stdout.trim().split("\\n").at(-1);
+  assert.ok(line, `isolated title probe returned no result: ${stderr}`);
+  return JSON.parse(line) as { error?: string; isError: boolean; heartbeat: boolean; elapsedMs: number; sourceBytes: number; title: string };
 }
 
 async function runIsolatedHtmlProbe(
@@ -145,7 +379,7 @@ async function runIsolatedHtmlProbe(
     }));
     if (result.details?.error !== expectedError || !heartbeat) process.exitCode = 1;
   `;
-  const child = spawn(process.execPath, ["--import=tsx", "--input-type=module", "-e", script], {
+  const child = nodeSpawn(process.execPath, ["--import=tsx", "--input-type=module", "-e", script], {
     env: { ...process.env, DPI_HTML_PROBE_KIND: kind, DPI_HTML_PROBE_SIZE: String(size), DPI_HTML_PROBE_MODE: mode },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -394,6 +628,17 @@ test("isolates malformed HTML conversion, enforces its deadline, and keeps the b
   assert.ok(cancelled.elapsedMs < 1_000, `conversion cancellation took ${cancelled.elapsedMs}ms`);
 });
 
+test("raw HTML and default text/plain title handling stay responsive to repeated open tags", async () => {
+  for (const [contentType, raw] of [["text/html", true], ["text/plain", false]] as const) {
+    const probe = await runIsolatedTitleProbe(contentType, raw, 30_000);
+    assert.ok(!probe.isError, `${contentType}, raw=${raw}`);
+    assert.equal(probe.heartbeat, true, `${contentType}, raw=${raw}: event-loop heartbeat must run`);
+    assert.equal(probe.title, "", `${contentType}, raw=${raw}: title extraction is omitted outside conversion`);
+    assert.equal(probe.sourceBytes, 210_000);
+    assert.ok(probe.elapsedMs < 500, `${contentType}, raw=${raw}: settlement was not bounded (${probe.elapsedMs}ms)`);
+  }
+});
+
 test("converts useful HTML structure, removes executable/style content, and reports truncation with source URL", async () => {
   const html = [
     "<!doctype html><html><head><title>Docs &amp; APIs</title><style>.hidden { display:none }</style></head>",
@@ -482,7 +727,7 @@ test("times out and propagates caller cancellation without leaving a fetch pendi
 test("web_search hard-kills a SIGTERM-ignoring child at timeout without waiting for its callback", async () => {
   const fixture = await createSigtermIgnoringFixture();
   try {
-    const extension = createWebExtension({ searchTimeoutMs: 120, execFile: fixture.execFile });
+    const extension = createWebExtension({ searchTimeoutMs: 120, spawn: fixture.spawn });
     const pending = getTools(extension).webSearch.execute({ query: "docs" } as never, {} as never, {} as never);
     await within(fixture.waitForSpawn(), 1_000, "timeout fixture did not spawn");
     const result = await within(pending, 800, "web_search did not settle after its hard timeout");
@@ -499,7 +744,7 @@ test("web_search hard-kills a SIGTERM-ignoring child on caller cancellation", as
   const fixture = await createSigtermIgnoringFixture();
   const controller = new AbortController();
   try {
-    const extension = createWebExtension({ searchTimeoutMs: 5_000, execFile: fixture.execFile });
+    const extension = createWebExtension({ searchTimeoutMs: 5_000, spawn: fixture.spawn });
     const pending = getTools(extension).webSearch.execute({ query: "docs" } as never, {} as never, { abortSignal: controller.signal } as never);
     await within(fixture.waitForSpawn(), 1_000, "cancellation fixture did not spawn");
     controller.abort();
@@ -513,13 +758,20 @@ test("web_search hard-kills a SIGTERM-ignoring child on caller cancellation", as
   }
 });
 
+test("web_search timeout kills its process group, inherited pipes, and grandchild", async () => {
+  await assertSearchProcessTreeKilled("timeout");
+});
+
+test("web_search cancellation kills its process group, inherited pipes, and grandchild", async () => {
+  await assertSearchProcessTreeKilled("cancel");
+});
+
 test("web_search passes bounded query data as one argv value and does not use a shell", async () => {
   let invocation: { command: string; args: readonly string[]; options: Record<string, unknown> } | undefined;
   const extension = createWebExtension({
-    execFile: ((command: string, args: readonly string[], options: Record<string, unknown>, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+    spawn: ((command: string, args: readonly string[], options: Record<string, unknown>) => {
       invocation = { command, args, options };
-      setImmediate(() => callback(null, "result title https://docs.example", ""));
-      return {};
+      return fakeSearchChild({ stdout: "result title https://docs.example" });
     }) as never,
   });
   const { webSearch } = getTools(extension);
@@ -528,7 +780,8 @@ test("web_search passes bounded query data as one argv value and does not use a 
   assert.equal(result.isError, undefined);
   assert.equal(invocation?.command, "mcporter");
   assert.equal(invocation?.options.shell, undefined);
-  assert.equal(invocation?.options.maxBuffer, 256_000);
+  assert.equal(invocation?.options.detached, process.platform !== "win32");
+  assert.deepEqual(invocation?.options.stdio, ["ignore", "pipe", "pipe"]);
   assert.equal(invocation?.args[0], "call");
   assert.equal(invocation?.args[1], "exa.web_search_exa");
   const payloadAt = invocation?.args.indexOf("--args") ?? -1;
@@ -544,57 +797,43 @@ test("web_search passes bounded query data as one argv value and does not use a 
 
 test("web_search reports missing mcporter without leaking stderr and caps query/result size", async () => {
   const missing = createWebExtension({
-    execFile: ((_command: string, _args: readonly string[], _options: Record<string, unknown>, callback: (error: NodeJS.ErrnoException | null, stdout: string, stderr: string) => void) => {
-      const error = Object.assign(new Error("spawn failed"), { code: "ENOENT" });
-      setImmediate(() => callback(error, "", "PRIVATE_DIAGNOSTIC_SENTINEL"));
-      return {};
-    }) as never,
+    spawn: (() => fakeSearchChild({ error: Object.assign(new Error("spawn failed"), { code: "ENOENT" }) })) as never,
   });
   const { webSearch } = getTools(missing);
   const unavailable = await webSearch.execute({ query: "docs" } as never, {} as never, {} as never);
   assert.equal(unavailable.isError, true);
   assert.match(outputText(unavailable), /mcporter.*not installed|Exa backend unavailable/i);
-  assert.doesNotMatch(JSON.stringify(unavailable), /PRIVATE_DIAGNOSTIC_SENTINEL/);
+  assert.doesNotMatch(JSON.stringify(unavailable), /spawn failed/);
 
   const extension = createWebExtension({
-    execFile: ((_command: string, _args: readonly string[], _options: Record<string, unknown>, callback: (error: null, stdout: string, stderr: string) => void) => {
-      setImmediate(() => callback(null, "x".repeat(300_000), ""));
-      return {};
-    }) as never,
+    maxSearchOutputBytes: 1_234,
+    spawn: (() => fakeSearchChild({ stdout: "x".repeat(1_235) })) as never,
   });
   const oversized = await getTools(extension).webSearch.execute({ query: "docs" } as never, {} as never, {} as never);
   assert.equal(oversized.isError, true);
   assert.match(outputText(oversized), /output exceeded.*limit/i);
 
-  let configuredMaxBuffer = 0;
   let timeoutKill: string | undefined;
+  let timeoutOptions: Record<string, unknown> | undefined;
   const timeout = createWebExtension({
     searchTimeoutMs: 20,
     maxSearchOutputBytes: 1_234,
-    execFile: ((_command: string, _args: readonly string[], options: Record<string, unknown>, _callback: (...args: never[]) => void) => {
-      configuredMaxBuffer = Number(options.maxBuffer);
-      assert.equal(options.timeout, undefined, "the parent owns a hard deadline instead of execFile's SIGTERM timeout");
-      return {
-        exitCode: null,
-        signalCode: null,
-        kill: (signal: string) => { timeoutKill = signal; return true; },
-      };
+    spawn: ((_command: string, _args: readonly string[], options: Record<string, unknown>) => {
+      timeoutOptions = options;
+      return fakeSearchChild({ close: false, onKill: (signal) => { timeoutKill = signal; } });
     }) as never,
   });
   const timed = await getTools(timeout).webSearch.execute({ query: "docs" } as never, {} as never, {} as never);
   assert.equal(timed.isError, true);
-  assert.equal(configuredMaxBuffer, 1_234);
+  assert.equal(timeoutOptions?.detached, process.platform !== "win32");
   assert.equal(timeoutKill, "SIGKILL");
   assert.match(outputText(timed), /timed out/i);
 
   const controller = new AbortController();
   let cancellationKill: string | undefined;
   const cancellable = createWebExtension({
-    execFile: ((_command: string, _args: readonly string[], _options: Record<string, unknown>, _callback: (...args: never[]) => void) => ({
-      exitCode: null,
-      signalCode: null,
-      kill: (signal: string) => { cancellationKill = signal; return true; },
-    })) as never,
+    spawn: ((_command: string, _args: readonly string[], _options: Record<string, unknown>) =>
+      fakeSearchChild({ close: false, onKill: (signal) => { cancellationKill = signal; } })) as never,
   });
   const pending = getTools(cancellable).webSearch.execute({ query: "docs" } as never, {} as never, { abortSignal: controller.signal } as never);
   controller.abort();

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -331,11 +332,11 @@ test("web tools use injected fetch only and report a missing search backend acti
       fetched.push(url.href);
       return webResponse("<html><head><title>Offline fixture docs</title></head><body><h1>Injected transport only</h1></body></html>");
     },
-    execFile: ((command: string, _args: readonly string[], _options: Record<string, unknown>, callback: (error: NodeJS.ErrnoException | null, stdout: string, stderr: string) => void) => {
+    spawn: ((command: string) => {
       searchInvocations.push(command);
-      const error = Object.assign(new Error("not installed"), { code: "ENOENT" });
-      setImmediate(() => callback(error, "", ""));
-      return {};
+      const child = new EventEmitter();
+      setImmediate(() => child.emit("error", Object.assign(new Error("not installed"), { code: "ENOENT" })));
+      return child as never;
     }) as never,
   };
   const web = createWebExtension(options);

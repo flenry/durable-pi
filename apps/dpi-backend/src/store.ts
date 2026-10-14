@@ -842,9 +842,13 @@ export class Store {
         if (policy.mode !== "read-only") policy.previousTools = saveToolSelection(agent.tools);
         policy.mode = "read-only";
         agent.tools = removeTools(agent.tools, writerNames);
-      } else {
-        if (policy.mode === "read-only") restoreToolSelection(agent, policy.previousTools);
-        else delete agent.tools;
+      } else if (policy.mode === "read-only") {
+        restoreToolSelection(agent, policy.previousTools);
+        policy.mode = "read-write";
+        policy.previousTools = { kind: "all" };
+      } else if (policy.mode === "unset") {
+        // Preserve the legacy first-disable behavior when no durable policy exists yet.
+        delete agent.tools;
         policy.mode = "read-write";
         policy.previousTools = { kind: "all" };
       }

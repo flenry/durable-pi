@@ -292,6 +292,70 @@ test("read-only policy survives onboarding upgrades and explicit disable restore
   }
 });
 
+test("read-only disable preserves allowlists and remove-lists across retries and restart", async () => {
+  const t = await tempStore();
+  const setupDir = await setupFixture(t.root);
+  let store: Store | undefined;
+  const env = { DPI_ONBOARD: "1", PI_SETUP_DIR: setupDir, DPI_MEMORY: "off", DPI_SKILLS_EXCLUDE: "" };
+  try {
+    await withOnboardEnv(env, async () => {
+      store = await t.open();
+      const cases = [
+        { name: "Allowlist", kind: "allow" as const },
+        { name: "Remove-list", kind: "remove" as const },
+      ];
+      const saved: { id: string; expected: string[]; name: string }[] = [];
+
+      for (const item of cases) {
+        const session = await store!.create({ name: item.name, cwd: t.work, model: faux });
+        const { row, c } = await store!.resolveAgent(session.id, "main");
+        const available = (await c.agent(BACKGROUND_CONTEXT)).tools;
+        const read = available.find((tool) => tool.name === "read");
+        const bash = available.find((tool) => tool.name === "bash");
+        assert.ok(read && bash);
+        await c.configure(
+          { tools: item.kind === "allow" ? [read] : { remove: [bash, read] } },
+          BACKGROUND_CONTEXT,
+        );
+        const expected = (await store!.agentDetail(row, c)).tools
+          .filter((tool) => tool.offered)
+          .map((tool) => tool.name)
+          .sort();
+        saved.push({ id: session.id, expected, name: item.name });
+
+        await store!.configure(row, c, { readOnly: true });
+        const readOnly = await store!.agentDetail(row, c);
+        assert.equal(readOnly.config.readOnly, true, item.name);
+        for (const tool of readOnly.tools.filter((candidate) => candidate.writes)) assert.equal(tool.offered, false, `${item.name}: ${tool.name}`);
+
+        await store!.configure(row, c, { readOnly: false });
+        let disabled = await store!.agentDetail(row, c);
+        assert.deepEqual(disabled.tools.filter((tool) => tool.offered).map((tool) => tool.name).sort(), expected, `${item.name}: first disable`);
+        await store!.configure(row, c, { readOnly: false });
+        disabled = await store!.agentDetail(row, c);
+        assert.deepEqual(disabled.tools.filter((tool) => tool.offered).map((tool) => tool.name).sort(), expected, `${item.name}: repeated disable`);
+      }
+
+      await store!.close();
+      store = undefined;
+      store = await t.open();
+      for (const item of saved) {
+        const { row, c } = await store!.resolveAgent(item.id, "main");
+        await store!.configure(row, c, { readOnly: false });
+        const disabled = await store!.agentDetail(row, c);
+        assert.deepEqual(
+          disabled.tools.filter((tool) => tool.offered).map((tool) => tool.name).sort(),
+          item.expected,
+          `${item.name}: disable after restart`,
+        );
+      }
+    });
+  } finally {
+    await store?.close();
+    await t.cleanup();
+  }
+});
+
 test("missing setup degrades gracefully without creating a local memory tree", async () => {
   const t = await tempStore();
   const missingSetup = join(t.root, "not-installed");

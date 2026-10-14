@@ -1,6 +1,7 @@
 import { parentPort, workerData } from "node:worker_threads";
 
 const SENSITIVE_QUERY_KEY = /(?:^|[-_])(?:access[-_]?token|refresh[-_]?token|token|api[-_]?key|key|secret|password|passwd|auth|authorization|credential|signature|sig)(?:$|[-_])/i;
+const MAX_TITLE_CHARS = 512;
 
 function escapeMarkdownLabel(label) {
   return label.replace(/\\/g, "\\\\").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
@@ -8,6 +9,11 @@ function escapeMarkdownLabel(label) {
 
 function stripTags(html) {
   return html.replace(/<[^>]*>/g, "");
+}
+
+function boundedTitle(title) {
+  const oneLine = title.replace(/[\r\n\t\0]+/g, " ").replace(/\s+/g, " ").trim();
+  return oneLine.length > MAX_TITLE_CHARS ? `${oneLine.slice(0, MAX_TITLE_CHARS - 1)}…` : oneLine;
 }
 
 function decodeEntities(text) {
@@ -40,7 +46,7 @@ function safeUrlForDisplay(url) {
 
 function htmlToMarkdown(html, baseUrl) {
   const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i);
-  const title = titleMatch ? decodeEntities(titleMatch[1].trim()) : "";
+  const title = titleMatch ? boundedTitle(decodeEntities(titleMatch[1].trim())) : "";
   let body = html
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<(script|style|noscript|svg|iframe|object|template)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, "")
