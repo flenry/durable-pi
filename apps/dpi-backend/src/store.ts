@@ -68,6 +68,8 @@ import { createPlayground, Workspace, type SpawnSession } from "./extensions.js"
 import { createJobs, JobRuns, JOB_DEFS, jobDef, resolveJobInput, type Jobs } from "./jobs.js";
 import { ADDON_INFO, createAddons, PROMPTS, PromptChecklist, type Addons } from "./addons.js";
 import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
+import { onboardEnabledFromEnv, onboardOptionsFromEnv, type OnboardOptions } from "./onboard/config.js";
+import { installOnboard } from "./onboard/index.js";
 
 export const DURABLE_VERSION = "1.0.3";
 
@@ -81,6 +83,8 @@ export const WRITE_TOOLS = new Set([
   "ping_on_call_engineer",
   "subagent",
   "start_session",
+  "memory_note",
+  "memory_rewrite",
 ]);
 
 export type SessionRow = {
@@ -185,7 +189,7 @@ export class Store {
     return this.options.startDirs;
   }
 
-  private constructor(readonly options: StoreOptions) {
+  private constructor(readonly options: StoreOptions, private readonly onboardOptions?: OnboardOptions) {
     this.models = createModels(
       options.provider === "subscription" ? { credentials: fileCredentialStore(options.authFile) } : undefined,
     );
@@ -220,7 +224,8 @@ export class Store {
   }
 
   static async open(options: StoreOptions) {
-    const store = new Store({ ...options, dataDir: resolve(options.dataDir) });
+    const onboardOptions = onboardEnabledFromEnv() ? onboardOptionsFromEnv() : undefined;
+    const store = new Store({ ...options, dataDir: resolve(options.dataDir) }, onboardOptions);
     // Start dirs are where new sessions begin; create any that do not exist yet.
     await Promise.all(options.startDirs.map((dir) => mkdir(dir, { recursive: true }).catch(() => {})));
     try {
@@ -536,6 +541,7 @@ export class Store {
       // Custom extensions are installed but not selected: an agent turns them on in its own selection.
       const addons = createAddons({ offline: this.options.provider === "faux" });
       for (const extension of addons.list) registry.install(extension);
+      const onboardExtensions = this.onboardOptions ? installOnboard(registry, this.onboardOptions) : [];
       const harness = await Harness.open(
         await openNodeSqliteStorage(row.dbPath),
         {
@@ -547,7 +553,7 @@ export class Store {
             await tx.doc(JobRuns, c.id);
           },
           settings: {
-            extensions: [CodingTools, playground],
+            extensions: [CodingTools, playground, ...onboardExtensions],
             // Read at every use, so a PATCH .../compaction applies from the next request.
             get compaction() {
               return compaction();

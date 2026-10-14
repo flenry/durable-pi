@@ -1,11 +1,19 @@
 // Onboard configuration: everything comes from env so the fork holds no personal paths or hosts.
 //
+//   DPI_ONBOARD         1 opts in to Phase 1 extensions; 0 or unset preserves legacy behavior
 //   PI_SETUP_DIR        the pi setup checkout (skills, experts, playbook, memory CLI); default ~/.pi
 //   DPI_MEMORY          local | ssh | off — where the memory CLI runs (default local)
 //   DPI_MEMORY_HOST     ssh alias of the memory host when DPI_MEMORY=ssh (e.g. memory-host)
 //   DPI_SKILLS_EXCLUDE  comma list of skills not offered to durable agents
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+export function onboardEnabledFromEnv(env = process.env): boolean {
+  const enabled = env.DPI_ONBOARD ?? "0";
+  if (enabled === "1") return true;
+  if (enabled === "0") return false;
+  throw Error(`DPI_ONBOARD must be 0 or 1; got ${enabled}`);
+}
 
 export interface OnboardOptions {
   setupDir: string;
@@ -23,9 +31,11 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
     throw Error(`DPI_MEMORY must be local, ssh, or off; got ${memory}`);
   const memoryHost = env.DPI_MEMORY_HOST ?? "";
   if (memory === "ssh" && !memoryHost) throw Error("DPI_MEMORY=ssh needs DPI_MEMORY_HOST (an ssh alias)");
+  const setupDir = env.PI_SETUP_DIR ?? "~/.pi";
+  if (!setupDir.trim()) throw Error("PI_SETUP_DIR must not be empty");
   const expand = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
   return {
-    setupDir: expand(env.PI_SETUP_DIR ?? "~/.pi"),
+    setupDir: expand(setupDir),
     memory,
     memoryHost,
     skillsExclude: (env.DPI_SKILLS_EXCLUDE ?? DEFAULT_SKILLS_EXCLUDE.join(","))
