@@ -49,12 +49,15 @@ import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { curatedModels, defaultModelId } from "./model-catalog.js";
 import { fauxModels, installFaux } from "./faux.js";
 import {
+  AgentDoc,
+  defineDoc,
   Harness,
   createRegistry,
   InboxDoc,
   type Conversation,
   type ConversationId,
   type ConversationRecord,
+  type AgentState,
   type EntryId,
   type TaskId,
   type SubmissionId,
@@ -86,6 +89,71 @@ export const WRITE_TOOLS = new Set([
   "memory_note",
   "memory_rewrite",
 ]);
+
+// Writer tools available before onboarding introduced memory mutations. Used only to recognize the legacy
+// read-only representation during the one-time upgrade migration.
+const LEGACY_WRITE_TOOLS = new Set([
+  "bash",
+  "write",
+  "edit",
+  "update_state",
+  "run_durable_job",
+  "ping_on_call_engineer",
+  "subagent",
+  "start_session",
+]);
+
+type SavedToolSelection =
+  | { kind: "all" }
+  | { kind: "allow"; names: string[] }
+  | { kind: "remove"; names: string[] };
+type ReadOnlyPolicyState = {
+  mode: "unset" | "read-only" | "read-write";
+  previousTools: SavedToolSelection;
+};
+
+const ReadOnlyPolicy = defineDoc<ReadOnlyPolicyState>({
+  kind: "dpi.store-read-only-policy",
+  version: 1,
+  scope: "conversation",
+  history: "rewindable",
+  fork: "asOf",
+  initial: () => ({ mode: "unset", previousTools: { kind: "all" } }),
+  checkpointWhen: () => true,
+});
+
+function saveToolSelection(tools: AgentState["tools"]): SavedToolSelection {
+  if (tools === undefined) return { kind: "all" };
+  if (Array.isArray(tools)) return { kind: "allow", names: [...tools] };
+  return { kind: "remove", names: [...tools.remove] };
+}
+
+function restoreToolSelection(agent: AgentState, saved: SavedToolSelection) {
+  if (saved.kind === "all") delete agent.tools;
+  else if (saved.kind === "allow") agent.tools = [...saved.names];
+  else agent.tools = { remove: [...saved.names] };
+}
+
+function cloneToolSelection(saved: SavedToolSelection): SavedToolSelection {
+  return saved.kind === "all" ? { kind: "all" } : { kind: saved.kind, names: [...saved.names] };
+}
+
+function removeTools(tools: AgentState["tools"], names: string[]): AgentState["tools"] {
+  if (names.length === 0) return tools;
+  const removed = new Set(names);
+  if (tools === undefined) return { remove: [...removed] };
+  if (Array.isArray(tools)) return tools.filter((name) => !removed.has(name));
+  return { remove: [...new Set([...tools.remove, ...removed])] };
+}
+
+function legacyReadOnlySelection(tools: AgentState["tools"], legacyWriters: string[]): boolean {
+  return (
+    tools !== undefined &&
+    !Array.isArray(tools) &&
+    legacyWriters.length > 0 &&
+    legacyWriters.every((name) => tools.remove.includes(name))
+  );
+}
 
 export type SessionRow = {
   id: string;
@@ -551,6 +619,12 @@ export class Store {
           conversationCreated: async (tx, c) => {
             await tx.doc(Workspace, c.id);
             await tx.doc(JobRuns, c.id);
+            if (c.owner) {
+              const inherited = await tx.doc(ReadOnlyPolicy, c.owner.conversationId);
+              const policy = await tx.doc(ReadOnlyPolicy, c.id);
+              policy.mode = inherited.mode;
+              policy.previousTools = cloneToolSelection(inherited.previousTools);
+            }
           },
           settings: {
             extensions: [CodingTools, playground, ...onboardExtensions],
@@ -571,9 +645,10 @@ export class Store {
           thinkingLevel,
         },
       });
-      // Route stored agent choices to this device's provider before recovery issues any request.
+      // Migrate and apply durable tool policies before recovery can issue any request.
       for (const record of await this.scanAll(harness)) {
         const conversation = (await harness.conversation(record.id, ctx))!;
+        await this.reconcileReadOnlyPolicy(harness, conversation, this.onboardOptions !== undefined);
         const previous = (await conversation.agent(ctx)).model;
         const routed = this.routedModel(previous);
         if (previous?.provider !== routed.provider || previous.modelId !== routed.modelId)
@@ -723,6 +798,59 @@ export class Store {
     return { agent, all: [...all.values()], offered: new Set(agent.tools.map((t) => t.name)) };
   }
 
+  private async reconcileReadOnlyPolicy(h: Harness, c: Conversation, migrateLegacy: boolean) {
+    const existing = await h.snapshot(ReadOnlyPolicy, c.id, ctx);
+    if (existing?.mode === "read-write") return;
+
+    const { all } = await this.toolsOf(c);
+    const writerNames = all.filter((tool) => WRITE_TOOLS.has(tool.name)).map((tool) => tool.name);
+    let previousTools = existing?.mode === "read-only" ? existing.previousTools : undefined;
+    let shouldApply = existing?.mode === "read-only";
+
+    if (!shouldApply && migrateLegacy) {
+      const agent = await h.snapshot(AgentDoc, c.id, ctx);
+      const tools = agent?.tools;
+      const legacyWriters = all.filter((tool) => LEGACY_WRITE_TOOLS.has(tool.name)).map((tool) => tool.name);
+      if (tools !== undefined && !Array.isArray(tools) && legacyReadOnlySelection(tools, legacyWriters)) {
+        shouldApply = true;
+        previousTools = {
+          kind: "remove",
+          names: tools.remove.filter((name) => !LEGACY_WRITE_TOOLS.has(name)),
+        };
+      }
+    }
+    if (!shouldApply) return;
+
+    await c.commit(async (tx) => {
+      const agent = await tx.doc(AgentDoc, c.id);
+      const policy = await tx.doc(ReadOnlyPolicy, c.id);
+      if (policy.mode !== "read-only") {
+        policy.mode = "read-only";
+        policy.previousTools = previousTools ?? saveToolSelection(agent.tools);
+      }
+      agent.tools = removeTools(agent.tools, writerNames);
+    }, ctx);
+  }
+
+  private async setReadOnlyPolicy(c: Conversation, enabled: boolean) {
+    const { all } = await this.toolsOf(c);
+    const writerNames = all.filter((tool) => WRITE_TOOLS.has(tool.name)).map((tool) => tool.name);
+    await c.commit(async (tx) => {
+      const agent = await tx.doc(AgentDoc, c.id);
+      const policy = await tx.doc(ReadOnlyPolicy, c.id);
+      if (enabled) {
+        if (policy.mode !== "read-only") policy.previousTools = saveToolSelection(agent.tools);
+        policy.mode = "read-only";
+        agent.tools = removeTools(agent.tools, writerNames);
+      } else {
+        if (policy.mode === "read-only") restoreToolSelection(agent, policy.previousTools);
+        else delete agent.tools;
+        policy.mode = "read-write";
+        policy.previousTools = { kind: "all" };
+      }
+    }, ctx);
+  }
+
   async agentDetail(row: SessionRow, c: Conversation): Promise<AgentDetail> {
     const { agent, all, offered } = await this.toolsOf(c);
     const writers = all.filter((t) => WRITE_TOOLS.has(t.name));
@@ -806,16 +934,8 @@ export class Store {
       cwd = (await this.browse(body.cwd)).path;
     }
     if (body.readOnly !== undefined && typeof body.readOnly !== "boolean") throw invalid("readOnly must be a boolean");
-    // Read only filters the agent's tools: the model is never offered the ones that create, update or delete.
-    const tools =
-      body.readOnly === true
-        ? { tools: { remove: (await this.toolsOf(c)).all.filter((t) => WRITE_TOOLS.has(t.name)) } }
-        : body.readOnly === false
-          ? { tools: null }
-          : {};
     await c.configure(
       {
-        ...tools,
         ...(model ? { model } : {}),
         ...(body.thinkingLevel ? { thinkingLevel: body.thinkingLevel as ThinkingLevel } : {}),
         ...(typeof body.instructions === "string" ? { instructions: body.instructions.slice(0, 12000) } : {}),
@@ -823,6 +943,7 @@ export class Store {
       },
       ctx,
     );
+    if (body.readOnly !== undefined) await this.setReadOnlyPolicy(c, body.readOnly);
     if (model && (c.id as number) === 1)
       this.catalog.prepare("UPDATE sessions SET model=?,provider=? WHERE id=?").run(model.modelId, model.provider, row.id);
     // Thresholds are shared by the session's agents; refit them when this model's window is too small for them.

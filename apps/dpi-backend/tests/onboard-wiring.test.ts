@@ -156,6 +156,142 @@ test("opt-in installs onboarding for new roots, filters memory mutations read-on
   }
 });
 
+test("read-only policy survives onboarding upgrades and explicit disable restores writers", async () => {
+  const t = await tempStore();
+  const setupDir = await setupFixture(t.root);
+  let store: Store | undefined;
+  try {
+    const session = await withOnboardEnv({ DPI_ONBOARD: "0" }, async () => {
+      store = await t.open();
+      const created = await store.create({ name: "Legacy read-only", cwd: t.work, model: faux });
+      const { row, c } = await store.resolveAgent(created.id, "main");
+      const legacyWriters = new Set([
+        "bash",
+        "write",
+        "edit",
+        "update_state",
+        "run_durable_job",
+        "ping_on_call_engineer",
+        "subagent",
+        "start_session",
+      ]);
+      const markLegacyReadOnly = async (agent: typeof c) => {
+        const writers = (await agent.agent(BACKGROUND_CONTEXT)).tools.filter((tool) => legacyWriters.has(tool.name));
+        assert.ok(writers.length > 0);
+        await agent.configure({ tools: { remove: writers } }, BACKGROUND_CONTEXT);
+      };
+      await markLegacyReadOnly(c);
+      const { h } = await store.resolveAgent(created.id, "main");
+      const { taskId } = await store.startJob(row, h, c, { job: "workspace-snapshot", input: { path: "." } });
+      const ownedChildId = await h.commit(
+        (tx) => tx.createConversation({ ownership: { kind: "task", taskId: taskId as TaskId } }).then((record) => record.id),
+        BACKGROUND_CONTEXT,
+      );
+
+      const childSummary = await store.createAgent(row, { from: "main" });
+      const child = await store.resolveAgent(created.id, String(childSummary.id));
+      await markLegacyReadOnly(child.c);
+
+      const restrictedSummary = await store.createAgent(row, { from: "main" });
+      const restricted = await store.resolveAgent(created.id, String(restrictedSummary.id));
+      const tools = (await restricted.c.agent(BACKGROUND_CONTEXT)).tools;
+      const bash = tools.find((tool) => tool.name === "bash");
+      const read = tools.find((tool) => tool.name === "read");
+      assert.ok(bash && read);
+      await restricted.c.configure({ tools: { remove: [bash, read] } }, BACKGROUND_CONTEXT);
+
+      const writableSummary = await store.createAgent(row, { from: "main" });
+      return {
+        id: created.id,
+        ownedChildId: ownedChildId as number,
+        childId: childSummary.id,
+        restrictedId: restrictedSummary.id,
+        writableId: writableSummary.id,
+      };
+    });
+
+    await store?.close();
+    store = undefined;
+
+    await withOnboardEnv(
+      { DPI_ONBOARD: "1", PI_SETUP_DIR: setupDir, DPI_MEMORY: "off", DPI_SKILLS_EXCLUDE: "" },
+      async () => {
+        store = await t.open();
+        const assertWriters = async (agentRef: string, expectedReadOnly: boolean) => {
+          const { row, c } = await store!.resolveAgent(session.id, agentRef);
+          const detail = await store!.agentDetail(row, c);
+          assert.equal(detail.config.readOnly, expectedReadOnly);
+          const offered = new Set(detail.tools.filter((tool) => tool.offered).map((tool) => tool.name));
+          if (expectedReadOnly) {
+            for (const tool of detail.tools.filter((item) => item.writes)) assert.equal(offered.has(tool.name), false, tool.name);
+          } else {
+            assert.ok(offered.has("memory_note"));
+            assert.ok(offered.has("memory_rewrite"));
+          }
+          return { row, c, offered };
+        };
+
+        const root = await assertWriters("main", true);
+        await assertWriters(String(session.ownedChildId), true);
+        await assertWriters(String(session.childId), true);
+        const custom = await assertWriters(String(session.restrictedId), false);
+        assert.equal(custom.offered.has("bash"), false, "custom writer exclusion is preserved");
+        assert.equal(custom.offered.has("read"), false, "custom reader exclusion is preserved");
+        assert.ok(custom.offered.has("write"), "a partial writer exclusion is not mistaken for read-only");
+        await assertWriters(String(session.writableId), false);
+
+        await store!.configure(custom.row, custom.c, { readOnly: true });
+        const customReadOnly = await store!.agentDetail(custom.row, custom.c);
+        for (const tool of customReadOnly.tools.filter((item) => item.writes)) assert.equal(tool.offered, false, tool.name);
+        assert.equal(customReadOnly.tools.find((tool) => tool.name === "read")?.offered, false);
+        await store!.configure(custom.row, custom.c, { readOnly: false });
+        const customRestored = await store!.agentDetail(custom.row, custom.c);
+        assert.equal(customRestored.config.readOnly, false);
+        assert.equal(customRestored.tools.find((tool) => tool.name === "bash")?.offered, false);
+        assert.equal(customRestored.tools.find((tool) => tool.name === "read")?.offered, false);
+        assert.ok(customRestored.tools.find((tool) => tool.name === "memory_note")?.offered);
+
+        await store!.configure(root.row, root.c, { readOnly: false });
+        const disabled = await store!.agentDetail(root.row, root.c);
+        assert.equal(disabled.config.readOnly, false);
+        assert.ok(disabled.tools.find((tool) => tool.name === "memory_note")?.offered);
+        assert.ok(disabled.tools.find((tool) => tool.name === "memory_rewrite")?.offered);
+      },
+    );
+
+    await (store as Store | undefined)?.close();
+    store = undefined;
+    await withOnboardEnv(
+      { DPI_ONBOARD: "1", PI_SETUP_DIR: setupDir, DPI_MEMORY: "off", DPI_SKILLS_EXCLUDE: "" },
+      async () => {
+        store = await t.open();
+        const { row, c } = await store!.resolveAgent(session.id, "main");
+        const detail = await store!.agentDetail(row, c);
+        assert.equal(detail.config.readOnly, false);
+        assert.ok(detail.tools.find((tool) => tool.name === "memory_note")?.offered);
+        assert.ok(detail.tools.find((tool) => tool.name === "memory_rewrite")?.offered);
+        await store!.configure(row, c, { readOnly: true });
+      },
+    );
+
+    await (store as Store | undefined)?.close();
+    store = undefined;
+    await withOnboardEnv(
+      { DPI_ONBOARD: "1", PI_SETUP_DIR: setupDir, DPI_MEMORY: "off", DPI_SKILLS_EXCLUDE: "" },
+      async () => {
+        store = await t.open();
+        const { row, c } = await store!.resolveAgent(session.id, "main");
+        const detail = await store!.agentDetail(row, c);
+        assert.equal(detail.config.readOnly, true);
+        for (const tool of detail.tools.filter((item) => item.writes)) assert.equal(tool.offered, false, tool.name);
+      },
+    );
+  } finally {
+    await store?.close();
+    await t.cleanup();
+  }
+});
+
 test("missing setup degrades gracefully without creating a local memory tree", async () => {
   const t = await tempStore();
   const missingSetup = join(t.root, "not-installed");
