@@ -44,6 +44,20 @@ The proactive demo has its own dependencies: `just proactive install`, `just pro
 
 ---
 
+## Run on your model subscriptions (this fork)
+
+`DPI_PROVIDER=subscription` runs agents on the subscriptions you are already logged in to with the [pi coding agent](https://github.com/earendil-works/pi) — ChatGPT/Codex and Claude — instead of an OpenRouter API key. The backend reads pi's `~/.pi/agent/auth.json` (override with `DPI_AUTH_FILE`), shares it with pi, and serializes OAuth refreshes under a lock so neither process invalidates the other's rotated token.
+
+```yaml
+# dpi-network.yaml, per device (log in with `pi` then `/login` on that device first)
+env_keys: []
+env:
+  DPI_PROVIDER: subscription
+  DPI_DEFAULT_MODEL: openai-codex/gpt-6.1-sol   # optional; any <openai-codex|anthropic>/<modelId>
+```
+
+The device lists every model from those providers you are logged in to. Jev features still need an OpenRouter or TypeSafe key.
+
 ## What is a durable agent?
 
 <p align="center">

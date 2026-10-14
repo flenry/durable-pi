@@ -37,7 +37,14 @@ import { join, dirname, resolve } from "node:path";
 import { homedir, hostname, platform } from "node:os";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
-import { createModels } from "@earendil-works/pi-ai/models";
+import { createModels, type MutableModels } from "@earendil-works/pi-ai/models";
+import {
+  fileCredentialStore,
+  installSubscription,
+  isSubscriptionProvider,
+  subscriptionDefault,
+  subscriptionModels,
+} from "./subscription.js";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { curatedModels, defaultModelId } from "./model-catalog.js";
 import { fauxModels, installFaux } from "./faux.js";
@@ -90,7 +97,9 @@ export interface StoreOptions {
   dataDir: string;
   startDirs: string[];
   name: string;
-  provider: "openrouter" | "faux";
+  provider: "openrouter" | "faux" | "subscription";
+  /** pi auth.json for provider "subscription"; defaults to ~/.pi/agent/auth.json. */
+  authFile?: string;
 }
 
 /** Agent documents a client may read or stream, by kind. */
@@ -141,7 +150,7 @@ const decodeCursor = (cursor?: string) => {
 };
 
 export class Store {
-  readonly models = createModels();
+  readonly models: MutableModels;
   readonly opened = new Map<string, Opened>();
   readonly errors = new Map<string, string>();
   readonly catalog: DatabaseSync;
@@ -177,7 +186,11 @@ export class Store {
   }
 
   private constructor(readonly options: StoreOptions) {
+    this.models = createModels(
+      options.provider === "subscription" ? { credentials: fileCredentialStore(options.authFile) } : undefined,
+    );
     if (options.provider === "faux") installFaux(this.models);
+    else if (options.provider === "subscription") installSubscription(this.models);
     else {
       const provider = openrouterProvider();
       const catalog = provider.getModels();
@@ -264,6 +277,7 @@ export class Store {
   }
 
   private defaultModel() {
+    if (this.options.provider === "subscription") return subscriptionDefault().modelId;
     return this.options.provider === "faux" ? fauxModels[0].id : defaultModelId;
   }
 
@@ -279,6 +293,7 @@ export class Store {
         reasoning: false,
         cost: { input: 0, output: 0 },
       }));
+    if (this.options.provider === "subscription") return subscriptionModels(this.models);
     const available = await this.models.getAvailable("openrouter", { signal: AbortSignal.timeout(10000) });
     return curatedModels.flatMap((c) => {
       const m = available.find((m) => m.id === c.id);
@@ -304,6 +319,13 @@ export class Store {
       const id = fauxModels.some((m) => m.id === model?.modelId) ? model!.modelId : fauxModels[0].id;
       return { provider: "faux", modelId: id };
     }
+    if (this.options.provider === "subscription") {
+      if (model && isSubscriptionProvider(model.provider) && this.models.getModel(model.provider, model.modelId))
+        return { provider: model.provider, modelId: model.modelId };
+      // A bare model id (e.g. the TUI passing info.defaultModel) resolves to whichever provider has it.
+      const byId = model && this.modelList.find((m) => m.id === model.modelId);
+      return byId ? { provider: byId.provider, modelId: byId.id } : subscriptionDefault();
+    }
     const exact = model?.provider === "openrouter" ? model.modelId : `${model?.provider}/${model?.modelId}`;
     return {
       provider: "openrouter",
@@ -316,7 +338,9 @@ export class Store {
     if (!m || typeof m.provider !== "string" || typeof m.modelId !== "string")
       throw invalid("model must be { provider, modelId }");
     const known =
-      this.options.provider === "faux"
+      this.options.provider === "subscription"
+        ? isSubscriptionProvider(m.provider) && !!this.models.getModel(m.provider, m.modelId)
+        : this.options.provider === "faux"
         ? m.provider === "faux" && fauxModels.some((f) => f.id === m.modelId)
         : m.provider === "openrouter" &&
           curatedModels.some((c) => c.id === m.modelId) &&

@@ -13,11 +13,18 @@ export interface BackendConfig {
   envFile: string;
   dataDir: string;
   startDirs: string[];
-  provider: "openrouter" | "faux";
+  provider: "openrouter" | "faux" | "subscription";
+  /** pi auth.json holding the subscription logins (DPI_PROVIDER=subscription). */
+  authFile: string;
   token: string;
 }
 
 const expand = (p: string) => (p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+
+function parseProvider(raw = "openrouter"): BackendConfig["provider"] {
+  if (raw === "faux" || raw === "subscription" || raw === "openrouter") return raw;
+  throw Error(`DPI_PROVIDER must be openrouter, subscription, or faux; got ${raw}`);
+}
 
 export function loadConfig(argv = process.argv.slice(2), env = process.env): BackendConfig {
   const flag = (key: string, fallback: string) => {
@@ -41,7 +48,8 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): Bac
       .split(":")
       .filter(Boolean)
       .map((p) => resolve(expand(p))),
-    provider: (env.DPI_PROVIDER ?? "openrouter") === "faux" ? "faux" : "openrouter",
+    provider: parseProvider(env.DPI_PROVIDER),
+    authFile: resolve(expand(env.DPI_AUTH_FILE ?? "~/.pi/agent/auth.json")),
     token: env.DPI_TOKEN ?? "",
   };
   if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535)
