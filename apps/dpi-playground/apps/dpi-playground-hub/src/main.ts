@@ -12,6 +12,7 @@ import { StreamMux } from "./mux.js";
 import { proxy } from "./proxy.js";
 import { guard } from "./guard.js";
 import { seedFromConfig } from "./seed.js";
+import { access, accessOptionsFromEnv, extraAllowedHosts } from "./access.js";
 
 const args = process.argv.slice(2);
 const option = (key: string, fallback: string) => {
@@ -43,6 +44,9 @@ if (host !== "127.0.0.1" && host !== "localhost") {
       if (a.family === "IPv4") allowedHosts.add(`${a.address}:${port}`);
 }
 
+for (const h of extraAllowedHosts()) allowedHosts.add(h);
+const accessOptions = accessOptionsFromEnv();
+
 const err = (code: string, message: string) => ({ error: { code, message } });
 type Handler = (req: express.Request, res: express.Response) => unknown;
 const safe =
@@ -61,6 +65,8 @@ const safe =
 
 const app = express();
 app.disable("x-powered-by");
+// Identity allowlist first, so the UI, API, and streams are all behind it.
+app.use(access(accessOptions));
 app.use("/api", guard(allowedHosts), express.json({ limit: "256kb" }));
 
 app.get("/api/network", (_req, res) => res.json({ configFile, devices: monitor.network() }));
@@ -112,6 +118,11 @@ server.listen(port, host, () => {
   console.log(`Durable Pi hub: http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
   console.log(
     `registry: ${registry.path}${configFile ? `  config: ${configFile}` : "  (no dpi-network.yaml)"}`,
+  );
+  console.log(
+    accessOptions.allowedEmails.length
+      ? `access: only ${accessOptions.allowedEmails.join(", ")} (via ${accessOptions.identityHeader}); log ${accessOptions.logFile}`
+      : "access: no identity allowlist (DPI_HUB_ALLOWED_EMAILS unset)",
   );
   console.log(
     `devices: ${
