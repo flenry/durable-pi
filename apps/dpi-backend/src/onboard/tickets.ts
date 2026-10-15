@@ -414,6 +414,8 @@ export interface TicketRunInput {
 export type TicketCheckpoint = {
   sliceIndex: number;
   children: Record<string, number>;
+  /** Per-slice worker submissions retried after a terminal empty/aborted response. */
+  attempts?: Record<string, number>;
   worktree?: string;
   branch?: string;
   checks: string[];
@@ -507,7 +509,7 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
   const task = defineTask<TicketRunInput, TicketCheckpoint, TicketRunResult>({
     name: TICKET_RUN_TASK_NAME,
     version: 1,
-    initial: () => ({ phase: "prepare", sliceIndex: 0, children: {}, checks: [] }),
+    initial: () => ({ phase: "prepare", sliceIndex: 0, children: {}, attempts: {}, checks: [] }),
     phases: {
       prepare: async (task, runtime, ctx) => {
         const claim = await store.claim(task.input.ticketId, task.input.device, task.input.runToken, task.id as number, now());
@@ -530,6 +532,7 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
             checkpoint: { ...task.state.checkpoint, phase: "build", worktree: worktree.worktree, branch: worktree.branch },
           }), ctx);
         } catch (error) {
+          if (runtime.signal.aborted) return;
           const note = `prepare failed: ${shortError(error)}`;
           await store.block(task.input.ticketId, note, now());
           await runtime.commit(() => ({
@@ -572,6 +575,7 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
             checkpoint: { ...task.state.checkpoint, phase: "done", pr },
           }), ctx);
         } catch (error) {
+          if (runtime.signal.aborted) return;
           await blockRun(task, runtime, ctx, store, `PR phase failed: ${shortError(error)}`, now());
         }
       },
@@ -587,6 +591,7 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
             outcome: { status: "completed", result: { ticketId: ticket.id, status: "done", pr } },
           }), ctx);
         } catch (error) {
+          if (runtime.signal.aborted) return;
           await blockRun(task, runtime, ctx, store, `Project history note failed: ${shortError(error)}`, now());
         }
       },
@@ -661,6 +666,21 @@ async function blockRun(
   }), ctx);
 }
 
+async function retryTicketSlice(
+  task: { state: { checkpoint: TicketCheckpoint } },
+  runtime: TicketRuntime,
+  ctx: Context,
+  sliceId: string,
+): Promise<boolean> {
+  const checkpoint = task.state.checkpoint;
+  const attempts = checkpoint.attempts ?? {};
+  const attempt = attempts[sliceId] ?? 0;
+  if (attempt >= 1) return false;
+  const nextCheckpoint = { ...checkpoint, attempts: { ...attempts, [sliceId]: attempt + 1 } };
+  await runtime.commit(() => ({ status: "running", checkpoint: nextCheckpoint }), ctx);
+  return true;
+}
+
 async function runPlanPhase(
   phase: "build" | "qa" | "review",
   slicesFor: (ticket: Ticket) => TicketSlice[],
@@ -697,15 +717,21 @@ async function runPlanPhase(
     const handle = await runtime.conversation(childId as ConversationId, ctx);
     if (!handle) throw new Error(`Ticket worker ${slice.expert} is unavailable`);
     const prompt = ticketSlicePrompt(ticket, slice, phase, cp.worktree ?? ticket.worktree ?? ticket.repo, cp.branch ?? ticket.branch ?? "");
-    const settled = await (await handle.submit({
-      type: "input",
-      content: prompt,
-      requestId: `ticket:${ticket.id}:${phase}:${slice.id}`,
-    }, ctx)).wait(ctx);
-    if (settled.status !== "done" || settled.type !== "input") throw new Error(`Worker ${slice.expert} ended ${settled.status}`);
-    const answer = await runtime.entry(settled.answer, ctx);
+    const attempt = cp.attempts?.[slice.id] ?? 0;
+    const requestId = `ticket:${ticket.id}:${phase}:${slice.id}${attempt ? `:retry-${attempt}` : ""}`;
+    const settled = await (await handle.submit({ type: "input", content: prompt, requestId }, ctx)).wait(ctx);
+    if (settled.status !== "done" || settled.type !== "input") {
+      if (await retryTicketSlice(task, runtime, ctx, slice.id)) return;
+      throw new Error(`Worker ${slice.expert} ended ${settled.status}`);
+    }
+    // `runtime.entry` reads the ticket task's conversation; worker answers live in the child conversation.
+    const childContext = await runtime.context(childId as ConversationId, ctx, settled.answer);
+    const answer = childContext.entries.find((entry) => entry.id === settled.answer);
     const result = answer?.model?.filter((message) => message.role === "assistant").map((message) => messageText(message as never)).join("\n").trim();
-    if (!result) throw new Error(`Worker ${slice.expert} returned no result`);
+    if (!result) {
+      if (await retryTicketSlice(task, runtime, ctx, slice.id)) return;
+      throw new Error(`Worker ${slice.expert} returned no result`);
+    }
     const blocked = ticketBlocker(result);
     if (blocked) throw new Error(blocked);
     if (!ticketCompleted(result)) throw new Error(`Worker ${slice.expert} did not confirm completion with TICKET_STATUS: COMPLETE`);
@@ -715,6 +741,7 @@ async function runPlanPhase(
     const nextCheckpoint: TicketCheckpoint = { ...cp, sliceIndex: cp.sliceIndex + 1, checks: [...new Set([...cp.checks, ...checks])] };
     await runtime.commit(() => ({ status: "running", checkpoint: nextCheckpoint }), ctx);
   } catch (error) {
+    if (runtime.signal.aborted) return;
     await blockRun(task, runtime, ctx, store, `${phase} slice ${slice.id} failed: ${shortError(error)}`, now());
   }
 }

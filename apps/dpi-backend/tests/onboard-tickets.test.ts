@@ -47,12 +47,12 @@ function ticket(overrides: Partial<Ticket> = {}): Ticket {
 }
 
 test("ticket work-path refusal matches plain-pi segment semantics", () => {
-  assert.equal(isTicketWorkPath("/Users/ced/personal/app"), false);
-  assert.equal(isTicketWorkPath("/Users/ced/work/app"), true);
-  assert.equal(isTicketWorkPath("/Users/ced/work-laptop/app"), true);
-  assert.equal(isTicketWorkPath("/Users/ced/office/app"), true);
-  assert.equal(isTicketWorkPath("/Users/ced/workspace/app"), false);
-  assert.equal(isTicketWorkPath("/Users/ced/WORK/app"), true);
+  assert.equal(isTicketWorkPath("/home/user/personal/app"), false);
+  assert.equal(isTicketWorkPath("/home/user/work/app"), true);
+  assert.equal(isTicketWorkPath("/home/user/work-laptop/app"), true);
+  assert.equal(isTicketWorkPath("/home/user/office/app"), true);
+  assert.equal(isTicketWorkPath("/home/user/workspace/app"), false);
+  assert.equal(isTicketWorkPath("/home/user/WORK/app"), true);
 });
 
 test("ticket store atomically claims at most one device ticket and releases blocked work", async () => {
