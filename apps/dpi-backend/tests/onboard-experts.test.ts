@@ -50,7 +50,7 @@ function fixtureClient(): MemoryClient {
       if (command === "expert") return expertResponse(String((input as { name?: unknown }).name)) as T;
       if (command === "roster") return [
         { name: "backend-engineer", description: "Backend expert", model: "faux/echo", thinking: "high" },
-        { name: "reviewer", description: "Cannot edit files", model: "faux/echo", thinking: "high" },
+        { name: "reviewer", description: "Edit/write unavailable", model: "faux/echo", thinking: "high" },
       ] as T;
       if (command === "index") return { index: "project memory" } as T;
       return { file: "notes/topic.md", chars: 1, overCap: false, created: true } as T;
@@ -65,7 +65,7 @@ function expertHarnessApi(options: { taskId?: number; conversationId?: number; c
     nextId: ROOT_CONVERSATION_ID + 1,
     conversations: [] as { id: number; owner?: { conversationId: number; taskId: number } }[],
     agents: new Map<number, Record<string, unknown>>(),
-    identities: new Map<number, { expert: string; excludedTools?: string[]; worktree?: { repoRoot: string; path: string; branch: string; baseCommit: string; namespace: string } | null }>(),
+    identities: new Map<number, { expert: string; excludedTools?: string[]; worktree?: { repoRoot: string; path: string; branch: string; baseCommit: string; namespace: string } | null; worktreeReady: boolean }>(),
     delegateChildren: { children: {} as Record<string, number> },
     tasks: new Map<number, { state: { status: string } }>([[taskId, { state: { status: "running" } }]]),
     submissions: [] as { content: string; requestId: string }[],
@@ -93,7 +93,7 @@ function expertHarnessApi(options: { taskId?: number; conversationId?: number; c
         return agent;
       }
       if (token === ExpertIdentity) {
-        const identity = state.identities.get(id!) ?? { expert: "", excludedTools: [], worktree: null };
+        const identity = state.identities.get(id!) ?? { expert: "", excludedTools: [], worktree: null, worktreeReady: false };
         state.identities.set(id!, identity);
         return identity;
       }
@@ -248,7 +248,7 @@ test("delegate creates a configured reviewer child with trusted identity and rep
   const delegate = extension.tools?.find((tool) => tool.name === "delegate");
   assert.ok(delegate);
   assert.equal(delegate.replay, "safe");
-  assert.match(delegate.description ?? "", /cannot edit files/);
+  assert.match(delegate.description ?? "", /edit\/write tools are unavailable \(bash still runs\)/);
   const fixture = expertHarnessApi();
   const result = await delegate.execute({ expert: "reviewer", task: "Review the current changes." } as never, fixture.api as never, context);
 
@@ -306,8 +306,8 @@ test("delegate is root-only and the roster is shown only to the root", async () 
   );
   const rootText = await render(ROOT_CONVERSATION_ID);
   assert.match(rootText ?? "", /backend-engineer.*Backend expert/);
-  assert.match(rootText ?? "", /reviewer.*Cannot edit files/);
-  assert.match(rootText ?? "", /cannot edit files, but bash and memory tools may remain/);
+  assert.match(rootText ?? "", /reviewer.*Edit\/write unavailable/);
+  assert.match(rootText ?? "", /edit\/write tools are unavailable \(bash still runs\)/);
   assert.equal(await render(ROOT_CONVERSATION_ID + 1), undefined);
 });
 
@@ -369,6 +369,8 @@ test("worktree delegation branches from the parent HEAD and reuses its worktree 
     const details = first.details as { worktree?: string; branch?: string } | undefined;
     assert.equal(details?.worktree, identity.worktree.path);
     assert.equal(details?.branch, identity.worktree.branch);
+    assert.equal(identity.worktreeReady, true);
+    await writeFile(join(identity.worktree.path, "child-progress.txt"), "legitimate child work");
 
     const resumedExtension = extensionForExperts();
     const resumedDelegate = resumedExtension.tools?.find((tool) => tool.name === "delegate");
@@ -377,6 +379,7 @@ test("worktree delegation branches from the parent HEAD and reuses its worktree 
     const listing = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
     assert.equal(listing.split("\n").filter((line) => line === `worktree ${identity.worktree!.path}`).length, 1);
     assert.equal(fixture.state.conversations.length, 1, "the recovered tool call does not create a duplicate conversation or worktree");
+    assert.equal(await readFile(join(identity.worktree.path, "child-progress.txt"), "utf8"), "legitimate child work", "ready worktrees retain legitimate child changes");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -427,7 +430,7 @@ test("worktree namespace isolates sessions that allocate the same child id", asy
   }
 });
 
-test("git worktree cancellation kills a slow post-checkout hook and replay reuses partial registration", async () => {
+test("git worktree cancellation after checkout verifies and reuses the registered worktree", async () => {
   if (process.platform === "win32") return;
   const root = await mkdtemp(join(tmpdir(), "dpi-delegate-hook-cancel-"));
   try {
@@ -480,8 +483,87 @@ test("git worktree cancellation kills a slow post-checkout hook and replay reuse
     assert.equal(fixture.state.conversations.length, 1);
     const identity = fixture.state.identities.get(ROOT_CONVERSATION_ID + 1)!;
     assert.ok(identity.worktree);
+    assert.equal(identity.worktreeReady, true, "a complete checkout is marked ready before child submission");
     const worktrees = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
     assert.equal(worktrees.split("\n").filter((line) => line === `worktree ${identity.worktree!.path}`).length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("worktree replay rejects a checkout interrupted during smudge", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "dpi-delegate-smudge-cancel-"));
+  try {
+    const repo = join(root, "repo");
+    const filterPids = join(root, "filter-pids.txt");
+    const filterScript = join(root, "slow-smudge.sh");
+    await mkdir(repo, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: repo, stdio: "ignore" });
+    await writeFile(join(repo, ".gitattributes"), "seed.txt filter=slow\n");
+    await writeFile(join(repo, "seed.txt"), "tracked seed\n");
+    await writeFile(filterScript, [
+      "#!/bin/sh",
+      "sleep 30 & child=$!",
+      `printf '%s %s\\n' "$$" "$child" > '${filterPids.replaceAll("'", "'\\''")}'`,
+      "wait",
+      "cat",
+    ].join("\n"));
+    await chmod(filterScript, 0o755);
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    execFileSync("git", ["config", "filter.slow.smudge", `${quote(filterScript)} ${quote(filterPids)}`], { cwd: repo });
+    execFileSync("git", ["config", "filter.slow.clean", "cat"], { cwd: repo });
+    execFileSync("git", ["config", "filter.slow.required", "true"], { cwd: repo });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "add", ".gitattributes", "seed.txt"], { cwd: repo, stdio: "ignore" });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], { cwd: repo, stdio: "ignore" });
+
+    const fixture = expertHarnessApi({ cwd: repo });
+    const extension = createExpertsExtension(fixtureClient(), {
+      maxChildren: 2,
+      childExtensions: ["coding-tools", "memory", "skills", "web"].map((name) => ({ name })) as never[],
+      gitTimeoutMs: 10_000,
+    });
+    const delegate = extension.tools?.find((tool) => tool.name === "delegate");
+    assert.ok(delegate);
+    const controller = new AbortController();
+    const args = { expert: "backend-engineer", task: "Implement from a complete checkout.", worktree: true };
+    const pending = delegate.execute(args as never, fixture.api as never, { abortSignal: controller.signal } as never);
+    await until(async () => {
+      try { await readFile(filterPids); return true; } catch { return false; }
+    }, 5_000, "smudge filter start");
+    const pids = (await readFile(filterPids, "utf8")).trim().split(/\s+/).map(Number);
+    assert.equal(pids.length, 2);
+    controller.abort();
+    await assert.rejects(pending, /cancel/i);
+    for (const pid of pids) {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        try { process.kill(pid, 0); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, `filter process ${pid} must be gone`);
+    }
+
+    const identity = fixture.state.identities.get(ROOT_CONVERSATION_ID + 1)!;
+    assert.ok(identity.worktree);
+    const worktree = identity.worktree;
+    assert.equal(identity.worktreeReady, false, "interrupted checkout preparation is not marked ready");
+    const tracked = execFileSync("git", ["ls-tree", "-r", "--name-only", "HEAD"], { cwd: repo, encoding: "utf8" });
+    assert.match(tracked, /(^|\n)seed\.txt(\n|$)/);
+    const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: worktree.path, encoding: "utf8" });
+    assert.notEqual(status.trim(), "", "the interrupted checkout must still be observably incomplete");
+    await assert.rejects(
+      delegate.execute(args as never, fixture.api as never, context),
+      /checkout is incomplete.*refusing to submit/i,
+    );
+    assert.equal(fixture.state.submissions.length, 0, "an incomplete checkout is never submitted to the child");
+    assert.equal(identity.worktreeReady, false, "a failed readiness check does not persist completion");
+    assert.equal(fixture.state.conversations.length, 1, "replay reuses the one registered child");
+    const worktrees = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
+    assert.equal(worktrees.split("\n").filter((line) => line === `worktree ${worktree.path}`).length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -543,7 +625,9 @@ test("faux provider receives a fully configured durable reviewer child", async (
       assert.deepEqual(childAgent.extensions.map((extension) => extension.name), ["coding-tools", "memory", "skills", "web"]);
       assert.match(childAgent.instructions ?? "", /Review the work/);
       assert.match(childAgent.instructions ?? "", /Cite evidence/);
-      assert.equal(childAgent.cwd, details.worktree);
+      assert.ok(details.worktree);
+      const worktreePath = details.worktree;
+      assert.equal(childAgent.cwd, worktreePath);
       const identity = await h.snapshot(ExpertIdentity, child.id, context);
       assert.deepEqual(identity?.excludedTools, ["edit", "write"]);
       const childDetail = await store!.agentDetail(row, child);
@@ -555,6 +639,7 @@ test("faux provider receives a fully configured durable reviewer child", async (
       assert.match(transcript, /notes\/worked\.md — reviewed patterns/);
       assert.match(transcript, /codebase-design/);
       assert.match(result.content?.map((part) => part.type === "text" ? part.text : "").join(" ") ?? "", /Expert reviewer completed/);
+      await writeFile(join(worktreePath, "restart-progress.txt"), "persisted readiness marker");
 
       // Simulate an upgrade which resets the ordinary tool selection; the durable profile exclusions must survive.
       const upgradeEntry = await child.commit(async (tx) => {
@@ -578,6 +663,7 @@ test("faux provider receives a fully configured durable reviewer child", async (
       const replayed = await invokeDelegate(reopened, ownerTaskId, taskArgs, "test-delegate-replay");
       assert.equal((replayed.details as { conversationId?: number } | undefined)?.conversationId, details.conversationId);
       assert.equal((await store!.agents(reopened.row)).length, childCountBeforeReplay, "restart replay reuses the durable child");
+      assert.equal(await readFile(join(worktreePath, "restart-progress.txt"), "utf8"), "persisted readiness marker", "the readiness marker survives restart without resetting child work");
       const reopenedChild = await reopened.h.conversation(details.conversationId as never, context);
       const reopenedFork = await reopened.h.conversation(forked.id as never, context);
       assert.ok(reopenedChild && reopenedFork);
@@ -591,7 +677,7 @@ test("faux provider receives a fully configured durable reviewer child", async (
       }
       assert.equal((await store!.agentDetail(reopened.row, reopenedChild)).config.readOnly, false);
       const worktrees = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
-      assert.equal(worktrees.split("\n").filter((line) => line === `worktree ${details.worktree}`).length, 1);
+      assert.equal(worktrees.split("\n").filter((line) => line === `worktree ${worktreePath}`).length, 1);
       await reopened.h.abortTask(ownerTaskId, context);
       cleanupOwner = undefined;
 

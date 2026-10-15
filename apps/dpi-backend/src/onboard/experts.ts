@@ -41,6 +41,8 @@ export interface ExpertIdentityState {
   expert: string;
   excludedTools: string[];
   worktree: ExpertWorktree | null;
+  /** Set only after worktree add succeeds or a pristine interrupted checkout is verified. */
+  worktreeReady: boolean;
 }
 
 /** Trusted identity written only by delegate in the same transaction that creates an expert child. */
@@ -50,7 +52,7 @@ export const ExpertIdentity = defineDoc<ExpertIdentityState>({
   scope: "conversation",
   history: "rewindable",
   fork: "asOf",
-  initial: () => ({ expert: "", excludedTools: [], worktree: null }),
+  initial: () => ({ expert: "", excludedTools: [], worktree: null, worktreeReady: false }),
   checkpointWhen: () => true,
 });
 
@@ -213,6 +215,7 @@ function listedWorktrees(output: string): { path: string; branch?: string }[] {
 /** Ensure only the namespace persisted with this delegation can be reused or repaired. */
 async function ensureWorktree(
   worktree: ExpertWorktree,
+  ready: boolean,
   ctx: Context,
   git: (cwd: string, args: string[], ctx: Context) => Promise<string>,
 ): Promise<void> {
@@ -223,8 +226,15 @@ async function ensureWorktree(
   const expectedRef = `refs/heads/${worktree.branch}`;
   const listing = listedWorktrees(await git(worktree.repoRoot, ["worktree", "list", "--porcelain"], ctx));
   const existing = listing.find((entry) => entry.path === expectedPath);
+  const verifyPreparedCheckout = async () => {
+    const head = await git(expectedPath, ["rev-parse", "--verify", "HEAD^{commit}"], ctx);
+    const status = await git(expectedPath, ["status", "--porcelain", "--untracked-files=all"], ctx);
+    if (head !== worktree.baseCommit || status)
+      throw new Error(`delegate worktree checkout is incomplete at ${expectedPath}; refusing to submit the child`);
+  };
   if (existing) {
     if (existing.branch !== expectedRef) throw new Error(`delegate worktree ${expectedPath} is attached to a different branch`);
+    if (!ready) await verifyPreparedCheckout();
     return;
   }
   if (existsSync(expectedPath)) throw new Error(`delegate worktree path already exists but is not registered: ${expectedPath}`);
@@ -236,6 +246,7 @@ async function ensureWorktree(
     } else {
       await git(worktree.repoRoot, ["worktree", "add", "-b", worktree.branch, expectedPath, worktree.baseCommit], ctx);
     }
+    if (!ready) await verifyPreparedCheckout();
   } catch (error) {
     if (controlError(error)) throw error;
     const detail = error instanceof Error ? error.message : String(error);
@@ -268,6 +279,7 @@ async function readOwnedChild(tx: Tx, taskId: TaskId) {
         baseCommit: worktree.baseCommit,
         namespace: worktree.namespace,
       } : null,
+      worktreeReady: identity.worktreeReady === true,
     },
   };
 }
@@ -294,10 +306,22 @@ async function submitToChild(
   expert: string,
   task: string,
   worktree: ExpertWorktree | undefined,
+  worktreeReady: boolean,
   ctx: Context,
   git: (cwd: string, args: string[], ctx: Context) => Promise<string>,
 ) {
-  if (worktree) await ensureWorktree(worktree, ctx, git);
+  if (worktree) {
+    await ensureWorktree(worktree, worktreeReady, ctx, git);
+    if (!worktreeReady) {
+      await api.commit(async (tx) => {
+        const identity = await tx.doc(ExpertIdentity, childId);
+        const current = identity.worktree as ExpertWorktree | null;
+        if (!current || current.namespace !== worktree.namespace || current.path !== worktree.path || current.branch !== worktree.branch)
+          throw new Error("delegate worktree identity changed before checkout was marked ready");
+        identity.worktreeReady = true;
+      }, ctx);
+    }
+  }
   const child = await api.conversation(childId, ctx);
   if (!child) throw new Error(`Expert child ${childId} is unavailable`);
   const detail: DelegateDetails = {
@@ -334,7 +358,7 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
   const delegate = defineTool({
     name: "delegate",
     description:
-      "Delegate a self-contained task to a configured durable expert. The child is owned by this call, resumes after restart, and is interrupted with its parent. Profile excludeTools are enforced exactly: excluding edit/write means the expert cannot edit files, but other tools may remain available; a parent read-only policy still removes all writing tools. At most DPI_MAX_CHILDREN live children are allowed per session; at capacity the tool reports that the caller should retry after a child completes.",
+      "Delegate a self-contained task to a configured durable expert. The child is owned by this call, resumes after restart, and is interrupted with its parent. Profile exclusions are exact: edit/write tools are unavailable (bash still runs) when excluded, though other tools may remain available; a parent read-only policy still removes all writing tools. At most DPI_MAX_CHILDREN live children are allowed per session; at capacity the tool reports that the caller should retry after a child completes.",
     parameters: Type.Object({
       expert: Type.String({ description: "Exact expert name from the available roster.", minLength: 1 }),
       task: Type.String({ description: "A self-contained task with context and observable expectations.", minLength: 1, maxLength: 100_000 }),
@@ -352,7 +376,16 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
           throw new Error("this delegate tool call already owns a child for a different expert");
         if (Boolean(existing.identity.worktree) !== (args.worktree === true))
           throw new Error("this delegate tool call already owns a child with a different worktree setting");
-        return submitToChild(api, existing.id, existing.identity.expert, args.task, existing.identity.worktree as ExpertWorktree | undefined, ctx, git);
+        return submitToChild(
+          api,
+          existing.id,
+          existing.identity.expert,
+          args.task,
+          existing.identity.worktree as ExpertWorktree | undefined,
+          existing.identity.worktreeReady,
+          ctx,
+          git,
+        );
       }
 
       const parent = await api.agent(ctx);
@@ -383,8 +416,9 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
         identity.expert = args.expert;
         identity.excludedTools = excludedTools;
         identity.worktree = worktree;
+        identity.worktreeReady = false;
         index.children[String(api.taskId)] = child.id as number;
-        return { id: child.id, identity: { expert: args.expert, worktree } };
+        return { id: child.id, identity: { expert: args.expert, worktree, worktreeReady: false } };
       }, ctx);
 
       if ("atCapacity" in created) {
@@ -394,7 +428,16 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
         throw new Error("this delegate tool call already owns a child for a different expert");
       if (Boolean(created.identity.worktree) !== (args.worktree === true))
         throw new Error("this delegate tool call already owns a child with a different worktree setting");
-      return submitToChild(api, created.id, created.identity.expert, args.task, created.identity.worktree as ExpertWorktree | undefined, ctx, git);
+      return submitToChild(
+        api,
+        created.id,
+        created.identity.expert,
+        args.task,
+        created.identity.worktree as ExpertWorktree | undefined,
+        created.identity.worktreeReady,
+        ctx,
+        git,
+      );
     },
   });
 
@@ -410,7 +453,7 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
           const description = typeof entry.description === "string" ? entry.description.replace(/\s+/g, " ").trim() : "";
           return [`- **${entry.name}**${description ? ` — ${description}` : ""}`];
         });
-        return ["## Available experts", ...(lines.length ? lines : ["_(no experts are configured)_"]), "", "Use `delegate(expert, task, { worktree? })` for an owned, resumable child. Build first, use QA to verify, and ask reviewer last. Profile exclusions are exact: excluding edit/write means the expert cannot edit files, but bash and memory tools may remain; a parent read-only policy removes all writers. At capacity, retry after a child completes."].join("\n");
+        return ["## Available experts", ...(lines.length ? lines : ["_(no experts are configured)_"]), "", "Use `delegate(expert, task, { worktree? })` for an owned, resumable child. Build first, use QA to verify, and ask reviewer last. Profile exclusions are exact: edit/write tools are unavailable (bash still runs) when excluded, while other tools such as memory may remain; a parent read-only policy removes all writers. At capacity, retry after a child completes."].join("\n");
       } catch {
         return "## Available experts\n\n_(expert roster unavailable; delegation can retry)_";
       }
