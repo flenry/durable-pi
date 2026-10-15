@@ -87,10 +87,73 @@ const PROCESS_OUTPUT_LIMIT = 1_000_000;
 const MAX_TICKETS = 200;
 const MAX_LOG_LINES = 20;
 const MAX_TICKET_STATE_CHARS = 85_000;
-// Every ordinary write leaves room for an atomic blocked transition to record its note and clear the lease.
+// Ordinary writes leave room for a blocked transition to record its note and clear the lease.
 const TICKET_STATE_RECOVERY_HEADROOM = 5_000;
+const MAX_BLOCKED_NOTE_CHARS = 1_000;
+const BLOCKED_NOTE_TRUNCATION_MARKER = "… [truncated]";
 const MAX_TICKET_PR_URL_CHARS = 2_000;
 const HOUR_HISTORY = 168;
+
+function truncateNoteWithMarker(note: string, maxChars: number): string {
+  if (note.length <= maxChars) return note;
+  if (maxChars <= BLOCKED_NOTE_TRUNCATION_MARKER.length)
+    return BLOCKED_NOTE_TRUNCATION_MARKER.slice(0, maxChars);
+  const prefix = Array.from(note).slice(0, maxChars - BLOCKED_NOTE_TRUNCATION_MARKER.length);
+  while (prefix.join("").length + BLOCKED_NOTE_TRUNCATION_MARKER.length > maxChars) prefix.pop();
+  return `${prefix.join("")}${BLOCKED_NOTE_TRUNCATION_MARKER}`;
+}
+
+function shrinkBlockedNoteToFit(
+  state: Record<string, unknown>,
+  doc: ReturnType<typeof ticketState>,
+  preferredTicketId: string | undefined,
+  limit: number,
+): boolean {
+  const tickets = Object.values(doc.tickets)
+    .filter((ticket) => typeof ticket.blockedNote === "string" && ticket.blockedNote.length > 0)
+    .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+  if (preferredTicketId) {
+    const preferred = tickets.find((ticket) => ticket.id === preferredTicketId);
+    if (preferred) {
+      tickets.splice(tickets.indexOf(preferred), 1);
+      tickets.unshift(preferred);
+    }
+  }
+  for (const ticket of tickets) {
+    const original = ticket.blockedNote!;
+    if (original.length <= BLOCKED_NOTE_TRUNCATION_MARKER.length) {
+      delete ticket.blockedNote;
+      return true;
+    }
+    const body = original.endsWith(BLOCKED_NOTE_TRUNCATION_MARKER)
+      ? original.slice(0, -BLOCKED_NOTE_TRUNCATION_MARKER.length)
+      : original;
+    const chars = Array.from(body);
+    let low = 0;
+    let high = chars.length;
+    let best: string | undefined;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = `${chars.slice(0, middle).join("")}${BLOCKED_NOTE_TRUNCATION_MARKER}`;
+      ticket.blockedNote = candidate;
+      if (JSON.stringify(state).length <= limit) {
+        best = candidate;
+        low = middle + 1;
+      } else high = middle - 1;
+    }
+    if (best !== undefined) {
+      ticket.blockedNote = best;
+      if (best !== original) return true;
+    }
+    if (original !== BLOCKED_NOTE_TRUNCATION_MARKER) {
+      ticket.blockedNote = BLOCKED_NOTE_TRUNCATION_MARKER;
+      return true;
+    }
+    delete ticket.blockedNote;
+    return true;
+  }
+  return false;
+}
 
 export const boundedRunner: ProcessRunner = (command, args, options) =>
   runBoundedProcess(command, args, {
@@ -130,7 +193,10 @@ function appendLog(ticket: Ticket, text: string, now: number | Date) {
 export class TicketStore {
   constructor(private readonly apply: <T>(change: (state: Record<string, unknown>) => T) => Promise<T>) {}
 
-  private transact<T>(change: (state: Record<string, unknown>) => T, recovery = false): Promise<T> {
+  private transact<T>(
+    change: (state: Record<string, unknown>) => T,
+    recovery?: { noteTicketId?: string },
+  ): Promise<T> {
     return this.apply((state) => {
       const before = JSON.stringify(state);
       const result = change(state);
@@ -141,24 +207,25 @@ export class TicketStore {
           if (ticket.log.length > MAX_LOG_LINES) ticket.log.splice(0, ticket.log.length - MAX_LOG_LINES);
         }
         let encoded = JSON.stringify(state);
-        const limit = recovery ? MAX_TICKET_STATE_CHARS : MAX_TICKET_STATE_CHARS - TICKET_STATE_RECOVERY_HEADROOM;
+        const ordinaryLimit = MAX_TICKET_STATE_CHARS - TICKET_STATE_RECOVERY_HEADROOM;
+        // Let follow-up queue work compact a state that a bounded release transition already raised above the ordinary limit.
+        const limit = recovery || before.length > ordinaryLimit ? MAX_TICKET_STATE_CHARS : ordinaryLimit;
         if (encoded !== before) {
           while (encoded.length > limit) {
-            const oldestDone = Object.values(doc.tickets)
-              .filter((ticket) => ticket.status === "done")
+            const oldestLog = Object.values(doc.tickets)
+              .filter((ticket) => ticket.log.length > 0)
               .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
-            if (oldestDone) delete doc.tickets[oldestDone.id];
+            if (oldestLog) oldestLog.log.shift();
             else {
-              // History is expendable; retain queue state and its lease before rejecting a bounded write.
-              const oldestLog = Object.values(doc.tickets)
-                .filter((ticket) => ticket.log.length > 0)
+              const oldestDone = Object.values(doc.tickets)
+                .filter((ticket) => ticket.status === "done")
                 .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
-              if (!oldestLog) throw new Error("Ticket queue reached its durable state limit; complete or prune a ticket first");
-              oldestLog.log.shift();
+              if (oldestDone) delete doc.tickets[oldestDone.id];
+              else if (!shrinkBlockedNoteToFit(state, doc, recovery?.noteTicketId, limit))
+                throw new Error("Ticket queue reached its durable state limit; complete or prune a ticket first");
             }
             encoded = JSON.stringify(state);
           }
-          if (encoded.length > limit) throw new Error("Ticket queue reached its durable state limit; complete or prune a ticket first");
         }
       }
       return result;
@@ -224,7 +291,7 @@ export class TicketStore {
         delete ticket.runToken;
       }
       if (note?.trim()) {
-        if (status === "blocked") ticket.blockedNote = note.trim().slice(0, 1000);
+        if (status === "blocked") ticket.blockedNote = truncateNoteWithMarker(note.trim(), MAX_BLOCKED_NOTE_CHARS);
         appendLog(ticket, note.trim(), now);
       } else ticket.updatedAt = new Date(now).toISOString();
       return clone(ticket);
@@ -236,12 +303,12 @@ export class TicketStore {
       const ticket = ticketState(state).tickets[id];
       if (!ticket || ticket.status !== "in-progress" || ticket.runToken !== runToken) return false;
       ticket.status = "blocked";
-      ticket.blockedNote = note.slice(0, 1000);
+      ticket.blockedNote = truncateNoteWithMarker(note, MAX_BLOCKED_NOTE_CHARS);
       delete ticket.runTaskId;
       delete ticket.runToken;
       appendLog(ticket, `blocked: ${note}`, now);
       return true;
-    }, true);
+    }, { noteTicketId: id });
   }
 
   async complete(id: string, pr: string, now: number, runToken: string): Promise<boolean> {
@@ -257,7 +324,7 @@ export class TicketStore {
       delete ticket.runToken;
       appendLog(ticket, `PR opened: ${pr}`, now);
       return true;
-    }, true);
+    }, {});
   }
 
   async setWorktree(
@@ -966,9 +1033,7 @@ export async function prepareTicketWorktree(
     if (path) registered.push({ path: await canonicalFuturePath(path), ref });
   }
   const existing = registered.find((entry) => entry.path === worktree);
-  // Older runs persisted worktree/branch only after checkout completed, so keep their already-started workers resumable.
-  const legacyReady = ticket.worktreeReady === undefined && Boolean(ticket.worktree && ticket.branch);
-  const ready = ticket.worktreeReady === true || legacyReady;
+  const ready = ticket.worktreeReady === true;
   const readGit = async (cwd: string, args: string[]) =>
     (await process("git", args, { cwd, signal })).stdout.trim();
   const prep = { worktree, branch, base: defaultBranch, baseCommit };

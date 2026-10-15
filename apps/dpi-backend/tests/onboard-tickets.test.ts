@@ -27,7 +27,7 @@ import {
   type Ticket,
   type TicketPlan,
 } from "../src/onboard/tickets.js";
-import { hourStamp, nextTopOfHour, selectReadyTicket } from "../src/onboard/scheduler.js";
+import { createTicketSchedulerTask, hourStamp, nextTopOfHour, selectReadyTicket } from "../src/onboard/scheduler.js";
 import { SharedState } from "../src/shared-state.js";
 
 const now = Date.parse("2026-10-15T10:30:00.000Z");
@@ -107,30 +107,70 @@ test("run-owned mutations are fenced by the active token and status", async () =
   assert.equal((await store.get(id))?.runToken, "run-new");
 });
 
-test("legacy ticket state migrates atomically out of user-editable App State", async () => {
-  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-migration-"));
+test("ticket queue stays isolated from user App State and never imports legacy-shaped values", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-isolation-"));
   const shared = await SharedState.open(join(root, "state.sqlite"));
-  const id = "legacy-ticket";
+  const id = "legacy-shaped-user-value";
+  const legacyValue = { version: 1, tickets: { [id]: ticket({ id }) }, processedHours: [] };
+  try {
+    await shared.initialize({ [TICKETS_STATE_KEY]: legacyValue } as never);
+    const tickets = new TicketStore((mutate) => shared.transactTicketState((state) => mutate(state as Record<string, unknown>)));
+    assert.equal(await tickets.get(id), undefined, "App State values are never imported into the ticket document");
+    assert.deepEqual((await shared.snapshot()).value[TICKETS_STATE_KEY], legacyValue, "ticket access leaves user App State untouched");
+
+    await tickets.add(ticket({ id: "dedicated-ticket" }));
+    assert.equal((await tickets.get("dedicated-ticket"))?.id, "dedicated-ticket");
+    assert.equal(await tickets.get(id), undefined);
+    assert.deepEqual((await shared.snapshot()).value[TICKETS_STATE_KEY], legacyValue, "dedicated writes do not overwrite legacy-shaped user data");
+  } finally {
+    await shared.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a near-limit owner block truncates its note, admits the next ticket, and survives reopen", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-release-pressure-"));
+  const path = join(root, "state.sqlite");
+  const ownerId = "near-limit-owner";
+  const nextId = "near-limit-next";
+  let shared = await SharedState.open(path);
   try {
     await shared.initialize({});
-    await shared.change({
-      operation: "create",
-      path: `/${TICKETS_STATE_KEY}`,
-      value: { version: 1, tickets: { [id]: ticket({ id }) }, processedHours: [] } as never,
+    const owner = ticket({
+      id: ownerId,
+      status: "in-progress",
+      runTaskId: 42,
+      runToken: "owner-token",
+      log: [],
     });
-    const before = await shared.snapshot();
-    const tickets = new TicketStore((mutate) => shared.transactTicketState((state) => mutate(state as Record<string, unknown>)));
-    assert.equal((await tickets.get(id))?.id, id);
-    const after = await shared.snapshot();
-    assert.equal(Object.hasOwn(after.value, TICKETS_STATE_KEY), false, "legacy queue data leaves user-editable App State");
-    assert.equal(after.revision, before.revision + 1, "App State revision observes the internal migration");
-    await shared.change({ operation: "create", path: `/${TICKETS_STATE_KEY}`, value: "unrelated user data" });
-    assert.equal((await tickets.get(id))?.id, id, "an unrelated value under the old key does not shadow dedicated ticket state");
-    assert.equal((await shared.snapshot()).value[TICKETS_STATE_KEY], "unrelated user data", "unrelated App State remains untouched");
-    const userValue = { version: 1, tickets: { [id]: { userOwned: true } }, processedHours: [] };
-    await shared.change({ operation: "update", path: `/${TICKETS_STATE_KEY}`, value: userValue as never });
-    assert.equal((await tickets.get(id))?.id, id, "a user value matching the legacy shape cannot shadow the dedicated queue");
-    assert.deepEqual((await shared.snapshot()).value[TICKETS_STATE_KEY], userValue, "lookalike user data is never overwritten");
+    const next = ticket({ id: nextId, createdAt: "2026-10-15T10:31:00.000Z" });
+    const queue = { version: 1, tickets: { [ownerId]: owner, [nextId]: next }, processedHours: [] };
+    const targetChars = 84_500;
+    const currentChars = JSON.stringify({ [TICKETS_STATE_KEY]: queue }).length;
+    owner.goal = `${owner.goal}${"x".repeat(targetChars - currentChars)}`;
+    assert.equal(JSON.stringify({ [TICKETS_STATE_KEY]: queue }).length, targetChars);
+    await shared.transactTicketState((state) => {
+      state[TICKETS_STATE_KEY] = queue as never;
+    });
+
+    const store = new TicketStore((mutate) => shared.transactTicketState((state) => mutate(state as Record<string, unknown>)));
+    const longNote = `Need operator action: ${"details ".repeat(500)}`;
+    assert.equal(await store.block(ownerId, longNote, now + 1_000, "owner-token"), true);
+    const blocked = await store.get(ownerId);
+    assert.equal(blocked?.status, "blocked");
+    assert.match(blocked?.blockedNote ?? "", /… \[truncated\]$/);
+    assert.ok((blocked?.blockedNote?.length ?? 1_000) < 1_000, "the actionable note is bounded by remaining document capacity");
+    assert.equal(blocked?.log.length, 0, "expendable logs are trimmed before the actionable note");
+    assert.ok(await shared.transactTicketState((state) => JSON.stringify(state).length) <= 85_000);
+
+    assert.equal((await store.claim(nextId, "command-center", "next-owner-token", 43, now + 2_000)).claimed, true);
+    await shared.close();
+    shared = await SharedState.open(path);
+    const reopened = new TicketStore((mutate) => shared.transactTicketState((state) => mutate(state as Record<string, unknown>)));
+    assert.equal((await reopened.get(ownerId))?.status, "blocked");
+    assert.match((await reopened.get(ownerId))?.blockedNote ?? "", /… \[truncated\]$/);
+    assert.equal((await reopened.get(nextId))?.runToken, "next-owner-token");
+    assert.equal((await reopened.get(nextId))?.status, "in-progress");
   } finally {
     await shared.close();
     await rm(root, { recursive: true, force: true });
@@ -209,6 +249,112 @@ test("durable scheduler calculates top-of-hour deadlines and stable idempotency 
   assert.equal(nextTopOfHour(now), Date.parse("2026-10-15T11:00:00.000Z"));
   assert.equal(nextTopOfHour(Date.parse("2026-10-15T11:00:00.000Z")), Date.parse("2026-10-15T11:00:00.000Z"));
   assert.equal(hourStamp(Date.parse("2026-10-15T11:47:00.000Z")), "2026-10-15T11:00:00.000Z");
+});
+
+test("scheduler wait, claim, and record survive hour-boundary restarts and backward clock skew", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-scheduler-clock-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  const boundary = Date.parse("2026-10-15T11:00:00.000Z");
+  const nextBoundary = Date.parse("2026-10-15T12:00:00.000Z");
+  const device = "command-center";
+  let clockNow = boundary - 1;
+  const state: Record<string, unknown> = {};
+  const store = new TicketStore(async (mutate) => mutate(state));
+  const firstId = "scheduler-first";
+  const secondId = "scheduler-second";
+  await store.add(ticket({ id: firstId, repo }));
+  await store.add(ticket({ id: secondId, repo, createdAt: "2026-10-15T10:31:00.000Z" }));
+
+  const created: { ticketId: string; device: string; runToken: string; runTaskId: number }[] = [];
+  const timerDeadlines: number[] = [];
+  let nextTaskId = 100;
+  const process = async (_command: string, args: readonly string[], options: { cwd?: string }) => ({
+    stdout: args[0] === "rev-parse" ? options.cwd ?? "" : "git@github.com:acme/repo.git",
+    stderr: "",
+  });
+  const scheduler = createTicketSchedulerTask({
+    store,
+    runTask: {} as never,
+    device,
+    enabled: true,
+    process,
+    now: () => clockNow,
+    timer: async (deadline) => {
+      timerDeadlines.push(deadline);
+      if (clockNow < deadline) clockNow = deadline;
+    },
+  });
+
+  type Checkpoint = { phase: "wait" | "record"; nextAt: number; hour?: string; ticketId?: string; runTaskId?: number; runToken?: string };
+  const activate = (checkpoint: Checkpoint) => {
+    const task = { id: 1, input: { device }, state: { status: "running", checkpoint } };
+    const runtime = {
+      signal: new AbortController().signal,
+      commit: async (change: (tx: unknown, current: unknown) => Promise<unknown> | unknown) => {
+        const next = await change({
+          createTask: async (_runTask: unknown, input: { ticketId: string; device: string; runToken: string }) => {
+            const runTaskId = nextTaskId++;
+            created.push({ ...input, runTaskId });
+            return runTaskId;
+          },
+        }, task);
+        if (next) task.state = next as typeof task.state;
+      },
+    };
+    return { task, runtime };
+  };
+  const ctx = BACKGROUND_CONTEXT;
+  try {
+    const initial = scheduler.definition.initial({ device });
+    assert.deepEqual(initial, { phase: "wait", nextAt: boundary }, "first wait is checkpointed before a restart just before the hour");
+
+    clockNow = boundary - 1;
+    const beforeHourRestart = activate(initial);
+    await scheduler.definition.phases.wait(beforeHourRestart.task as never, beforeHourRestart.runtime as never, ctx);
+    assert.equal(clockNow, boundary);
+    assert.deepEqual(timerDeadlines, [boundary]);
+    assert.equal(created.length, 1);
+    const firstRecordCheckpoint = beforeHourRestart.task.state.checkpoint as Checkpoint;
+    assert.equal(firstRecordCheckpoint.phase, "record");
+    assert.equal(firstRecordCheckpoint.hour, hourStamp(boundary));
+
+    const firstRun = created[0];
+    assert.equal((await store.claim(firstRun.ticketId, firstRun.device, firstRun.runToken, firstRun.runTaskId, clockNow)).claimed, true,
+      "the task created at the boundary claims the queue before its start is recorded");
+
+    clockNow = boundary + 250;
+    const afterHourRestart = activate(JSON.parse(JSON.stringify(firstRecordCheckpoint)) as Checkpoint);
+    await scheduler.definition.phases.record(afterHourRestart.task as never, afterHourRestart.runtime as never, ctx);
+    assert.equal(afterHourRestart.task.state.checkpoint.phase, "wait");
+    assert.equal(afterHourRestart.task.state.checkpoint.nextAt, nextBoundary);
+    assert.equal(created.length, 1, "restarting after the hour records the existing run instead of starting another");
+    assert.equal(await store.wasHourProcessed(hourStamp(boundary)), true);
+
+    clockNow = boundary - 1;
+    const skewedRestart = activate({ phase: "wait", nextAt: boundary });
+    await scheduler.definition.phases.wait(skewedRestart.task as never, skewedRestart.runtime as never, ctx);
+    assert.equal(created.length, 1, "backward clock skew cannot rerun an already-recorded hour");
+    assert.equal(skewedRestart.task.state.checkpoint.nextAt, nextBoundary);
+
+    assert.equal(await store.block(firstId, "first run released", clockNow + 1, firstRun.runToken), true);
+    clockNow = nextBoundary - 1;
+    const nextHourRestart = activate(afterHourRestart.task.state.checkpoint as Checkpoint);
+    await scheduler.definition.phases.wait(nextHourRestart.task as never, nextHourRestart.runtime as never, ctx);
+    assert.equal(clockNow, nextBoundary);
+    assert.equal(created.length, 2, "the next hour admits the next ready ticket");
+    const secondRun = created[1];
+    assert.equal(secondRun.ticketId, secondId);
+    assert.equal((await store.claim(secondRun.ticketId, secondRun.device, secondRun.runToken, secondRun.runTaskId, clockNow)).claimed, true);
+
+    clockNow = nextBoundary + 250;
+    const secondAfterHourRestart = activate(JSON.parse(JSON.stringify(nextHourRestart.task.state.checkpoint)) as Checkpoint);
+    await scheduler.definition.phases.record(secondAfterHourRestart.task as never, secondAfterHourRestart.runtime as never, ctx);
+    assert.equal(await store.wasHourProcessed(hourStamp(nextBoundary)), true);
+    assert.equal(created.length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("reminder time parser accepts ISO timestamps and bounded relative durations", () => {
@@ -395,6 +541,13 @@ test("ticket worktree starts from origin default and reuses the same branch afte
     execFileSync("git", ["remote", "set-head", "origin", "main"], { cwd: repo });
     const current = ticket({ repo });
     const first = await prepareTicketWorktree(current);
+    await writeFile(join(first.worktree, "README.md"), "unready worker edit\n");
+    await assert.rejects(
+      prepareTicketWorktree({ ...current, worktree: first.worktree, branch: first.branch }),
+      /checkout is incomplete/i,
+      "missing readiness must not trust an existing dirty worktree",
+    );
+    await writeFile(join(first.worktree, "README.md"), "fixture\n");
     const resumed = await prepareTicketWorktree({ ...current, worktree: first.worktree, branch: first.branch });
     assert.equal(first.branch, `ticket/${current.id}`);
     assert.equal(resumed.worktree, first.worktree);

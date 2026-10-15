@@ -21,18 +21,13 @@ const TicketData = defineDoc<AppState>({
   scope: "session",
   initial: () => ({}),
 });
-const LEGACY_TICKET_STATE_KEY = "dpi.tickets";
 const MAX_TICKET_STATE_CHARS = 85_000;
-const Meta = defineDoc<{ initialized: boolean; revision: number; ticketStateMigrated?: boolean }>({
+const Meta = defineDoc<{ initialized: boolean; revision: number }>({
   kind: "app.shared-state-meta",
   version: 1,
   scope: "session",
   initial: () => ({ initialized: false, revision: 0 }),
 });
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 const Receipts = defineDocFamily<{ applied: boolean; result: string }, null>({
   kind: "app.shared-state-receipt",
   version: 1,
@@ -87,23 +82,7 @@ export class SharedState {
   /** Ticket queue persistence is isolated from user-editable App State so unrelated growth cannot strand leases. */
   async transactTicketState<T>(change: (state: AppState) => T): Promise<T> {
     return this.harness.commit(async (tx) => {
-      const meta = await tx.doc(Meta);
       const data = await tx.doc(TicketData);
-      if (!meta.ticketStateMigrated) {
-        const appState = await tx.doc(Data);
-        if (!Object.hasOwn(data, LEGACY_TICKET_STATE_KEY) && Object.hasOwn(appState, LEGACY_TICKET_STATE_KEY)) {
-          const legacy = appState[LEGACY_TICKET_STATE_KEY];
-          const ticketLike = isRecord(legacy) && legacy.version === 1;
-          if (ticketLike) {
-            if (!isRecord(legacy.tickets) || !Array.isArray(legacy.processedHours))
-              throw Error("Legacy ticket state is invalid; refusing to move user App State data");
-            data[LEGACY_TICKET_STATE_KEY] = JSON.parse(JSON.stringify(legacy)) as AppState[string];
-            delete appState[LEGACY_TICKET_STATE_KEY];
-            meta.revision++;
-          }
-        }
-        meta.ticketStateMigrated = true;
-      }
       const result = change(data);
       if (JSON.stringify(data).length > MAX_TICKET_STATE_CHARS)
         throw Error("Ticket state must be under 85,000 characters");
