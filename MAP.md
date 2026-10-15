@@ -1,0 +1,6 @@
+- `apps/dpi-backend/`: [Durable device backend](apps/dpi-backend/folder-map.md)
+- `apps/dpi-backend/src/`: [Backend source](apps/dpi-backend/src/folder-map.md)
+- `apps/dpi-backend/tests/`: [Backend tests](apps/dpi-backend/tests/folder-map.md)
+- `apps/dpi-tui/`: [Durable terminal client](apps/dpi-tui/folder-map.md)
+- `apps/dpi-tui/src/`: [Terminal client source](apps/dpi-tui/src/folder-map.md)
+- `apps/dpi-tui/tests/`: [Terminal client tests](apps/dpi-tui/tests/folder-map.md)

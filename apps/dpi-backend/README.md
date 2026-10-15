@@ -30,7 +30,8 @@ With the repo's network config, `just net up local && just backend run` does the
 | `DPI_DATA_DIR` | `$DPI_HOME/backend` | catalog, app state, `sessions/`, `archive/` |
 | `DPI_HOME` | `~/.dpi` | where `backend.env` is read (set by the service unit) |
 | `DPI_ENV_FILE` | `$DPI_HOME/backend.env` | the env file to read |
-| `DPI_PROVIDER` | `openrouter` | `faux` gives a free deterministic model for tests |
+| `DPI_PROVIDER` | `openrouter` | `faux` gives a free deterministic model for tests; `subscription` uses pi's Codex/Anthropic logins |
+| `DPI_SCOPED_MODELS` | all available subscription models | ordered comma-separated `provider/modelId` allowlist advertised to clients in subscription mode; unknown IDs fail startup, logged-out providers are omitted. Set it in the device YAML `env` to preserve it across `just net up`. This narrows pickers/cycling, not model access for existing sessions |
 | `OPENROUTER_API_KEY` | | model access, required unless `DPI_PROVIDER=faux`. Without it the device lists no models. Never sent to clients |
 | `TYPESAFE_API_KEY` | | optional: `jev-damage-control` asks Jev with it, else through OpenRouter |
 

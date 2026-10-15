@@ -9,6 +9,7 @@ import type { CreateModelsOptions, MutableModels } from "@earendil-works/pi-ai/m
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import type { ModelInfo } from "../../dpi-sdk/src/api.js";
+import { HAIKU_5_5 } from "./subscription-models.js";
 
 export const SUBSCRIPTION_PROVIDERS = ["openai-codex", "anthropic"] as const;
 export type SubscriptionProvider = (typeof SUBSCRIPTION_PROVIDERS)[number];
@@ -95,11 +96,27 @@ export function fileCredentialStore(file = DEFAULT_AUTH_FILE): CredentialStore {
 /** Register the subscription providers on a Models registry created with fileCredentialStore. */
 export function installSubscription(models: MutableModels): void {
   models.setProvider(openaiCodexProvider());
-  models.setProvider(anthropicProvider());
+  const anthropic = anthropicProvider();
+  const chat = anthropic.getModels();
+  if (!chat.some((m) => m.id === HAIKU_5_5.id)) {
+    const all = anthropic.getAllModels?.() ?? chat;
+    anthropic.getModels = () => [...chat, HAIKU_5_5];
+    anthropic.getAllModels = () => [...all, HAIKU_5_5];
+  }
+  models.setProvider(anthropic);
 }
 
-/** Models of the subscription providers you are logged in to, for GET /v1/device. */
-export async function subscriptionModels(models: MutableModels): Promise<ModelInfo[]> {
+/** Authenticated models advertised to clients; optional scope is ordered provider/modelId CSV. */
+export async function subscriptionModels(models: MutableModels, env = process.env): Promise<ModelInfo[]> {
+  const scope = env.DPI_SCOPED_MODELS?.trim()
+    ? [...new Set(env.DPI_SCOPED_MODELS.split(",").map((id) => id.trim()))]
+    : undefined;
+  for (const id of scope ?? []) {
+    const slash = id.indexOf("/");
+    const provider = id.slice(0, slash);
+    if (slash < 1 || !isSubscriptionProvider(provider) || !models.getModel(provider, id.slice(slash + 1)))
+      throw Error(`DPI_SCOPED_MODELS: unknown subscription model ${id}; use provider/modelId`);
+  }
   const out: ModelInfo[] = [];
   for (const provider of SUBSCRIPTION_PROVIDERS) {
     const available = await models.getAvailable(provider, { signal: AbortSignal.timeout(10_000) });
@@ -115,7 +132,9 @@ export async function subscriptionModels(models: MutableModels): Promise<ModelIn
         cost: { input: m.cost.input, output: m.cost.output },
       });
   }
-  return out;
+  if (!scope) return out;
+  const available = new Map(out.map((m) => [`${m.provider}/${m.id}`, m]));
+  return scope.flatMap((id) => available.has(id) ? [available.get(id)!] : []);
 }
 
 /** The default model as `provider/modelId`, overridable with DPI_DEFAULT_MODEL. */
