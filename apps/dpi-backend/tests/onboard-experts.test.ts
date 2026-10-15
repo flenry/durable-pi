@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, ROOT_CONVERSATION_ID, defineTask, type Tx } from "@earendil-works/pi-durable";
 import { Store } from "../src/store.js";
-import { faux, tempStore } from "./helpers.js";
+import { faux, tempStore, until } from "./helpers.js";
 import type { MemoryClient } from "../src/onboard/memory-client.js";
 import { createMemoryExtension } from "../src/onboard/memory.js";
 import { createExpertsExtension, DelegateChildren, ExpertIdentity } from "../src/onboard/experts.js";
@@ -50,7 +50,7 @@ function fixtureClient(): MemoryClient {
       if (command === "expert") return expertResponse(String((input as { name?: unknown }).name)) as T;
       if (command === "roster") return [
         { name: "backend-engineer", description: "Backend expert", model: "faux/echo", thinking: "high" },
-        { name: "reviewer", description: "Read-only reviewer", model: "faux/echo", thinking: "high" },
+        { name: "reviewer", description: "Cannot edit files", model: "faux/echo", thinking: "high" },
       ] as T;
       if (command === "index") return { index: "project memory" } as T;
       return { file: "notes/topic.md", chars: 1, overCap: false, created: true } as T;
@@ -65,7 +65,7 @@ function expertHarnessApi(options: { taskId?: number; conversationId?: number; c
     nextId: ROOT_CONVERSATION_ID + 1,
     conversations: [] as { id: number; owner?: { conversationId: number; taskId: number } }[],
     agents: new Map<number, Record<string, unknown>>(),
-    identities: new Map<number, { expert: string; worktree?: { repoRoot: string; path: string; branch: string; baseCommit: string } }>(),
+    identities: new Map<number, { expert: string; excludedTools?: string[]; worktree?: { repoRoot: string; path: string; branch: string; baseCommit: string; namespace: string } | null }>(),
     delegateChildren: { children: {} as Record<string, number> },
     tasks: new Map<number, { state: { status: string } }>([[taskId, { state: { status: "running" } }]]),
     submissions: [] as { content: string; requestId: string }[],
@@ -93,7 +93,7 @@ function expertHarnessApi(options: { taskId?: number; conversationId?: number; c
         return agent;
       }
       if (token === ExpertIdentity) {
-        const identity = state.identities.get(id!) ?? { expert: "" };
+        const identity = state.identities.get(id!) ?? { expert: "", excludedTools: [], worktree: null };
         state.identities.set(id!, identity);
         return identity;
       }
@@ -121,10 +121,37 @@ function expertHarnessApi(options: { taskId?: number; conversationId?: number; c
   return { api, state, tx };
 }
 
-function extensionForExperts(options: { maxChildren?: number; writeTools?: ReadonlySet<string> } = {}) {
+function extensionForExperts(options: { maxChildren?: number } = {}) {
   const client = fixtureClient();
   const children = ["coding-tools", "memory", "skills", "web"].map((name) => ({ name })) as never[];
-  return createExpertsExtension(client, { maxChildren: options.maxChildren ?? 2, childExtensions: children, writeTools: options.writeTools ?? new Set(["bash", "write", "edit", "memory_note", "memory_rewrite", "delegate"]) });
+  return createExpertsExtension(client, { maxChildren: options.maxChildren ?? 2, childExtensions: children });
+}
+
+async function invokeDelegate(
+  resolved: Awaited<ReturnType<Store["resolveAgent"]>>,
+  taskId: number,
+  args: { expert: string; task: string; worktree?: boolean },
+  callId: string,
+) {
+  const { h, c } = resolved;
+  const agent = await c.agent(context);
+  const delegate = agent.tools.find((tool) => tool.name === "delegate")
+    ?? agent.extensions.flatMap((extension) => extension.tools ?? []).find((tool) => tool.name === "delegate");
+  assert.ok(delegate);
+  return delegate.execute(
+    args as never,
+    {
+      taskId,
+      conversationId: c.id,
+      callId,
+      agent: (ctx: typeof context) => c.agent(ctx),
+      commit: (change: (tx: Tx) => unknown, ctx: typeof context) => c.commit(change, ctx),
+      snapshot: (token: never, id: never, ctx: typeof context) => h.snapshot(token, id, ctx),
+      details: async () => {},
+      conversation: (id: never, ctx: typeof context) => h.conversation(id, ctx),
+    } as never,
+    context,
+  );
 }
 
 async function withExpertFixtureEnv<T>(env: NodeJS.ProcessEnv, run: () => Promise<T>): Promise<T> {
@@ -221,6 +248,7 @@ test("delegate creates a configured reviewer child with trusted identity and rep
   const delegate = extension.tools?.find((tool) => tool.name === "delegate");
   assert.ok(delegate);
   assert.equal(delegate.replay, "safe");
+  assert.match(delegate.description ?? "", /cannot edit files/);
   const fixture = expertHarnessApi();
   const result = await delegate.execute({ expert: "reviewer", task: "Review the current changes." } as never, fixture.api as never, context);
 
@@ -228,6 +256,7 @@ test("delegate creates a configured reviewer child with trusted identity and rep
   const childId = fixture.state.conversations[0].id;
   assert.equal(fixture.state.conversations[0].owner?.taskId, 10);
   assert.equal(fixture.state.identities.get(childId)?.expert, "reviewer");
+  assert.deepEqual(fixture.state.identities.get(childId)?.excludedTools, ["edit", "write"]);
   const child = fixture.state.agents.get(childId)!;
   assert.deepEqual(child.model, { provider: "faux", modelId: "echo" });
   assert.equal(child.thinkingLevel, "high");
@@ -237,8 +266,10 @@ test("delegate creates a configured reviewer child with trusted identity and rep
   assert.deepEqual(child.extensions, ["coding-tools", "memory", "skills", "web"]);
   assert.ok(Array.isArray(child.tools));
   assert.ok((child.tools as string[]).includes("read"));
-  for (const name of ["bash", "write", "edit", "memory_note", "memory_rewrite", "delegate"])
-    assert.equal((child.tools as string[]).includes(name), false, `${name} is excluded from the read-only reviewer`);
+  for (const name of ["edit", "write"])
+    assert.equal((child.tools as string[]).includes(name), false, `${name} is excluded by the reviewer profile`);
+  for (const name of ["bash", "memory_note", "memory_rewrite"])
+    assert.equal((child.tools as string[]).includes(name), true, `${name} remains available because it is not excluded`);
   assert.deepEqual(fixture.state.submissions, [{ type: "input", content: "Review the current changes.", requestId: "child:10" }]);
   assert.equal((result.details as { conversationId?: number } | undefined)?.conversationId, childId);
   assert.match(result.content?.map((part) => part.type === "text" ? part.text : "").join(" ") ?? "", /reviewer/);
@@ -275,7 +306,8 @@ test("delegate is root-only and the roster is shown only to the root", async () 
   );
   const rootText = await render(ROOT_CONVERSATION_ID);
   assert.match(rootText ?? "", /backend-engineer.*Backend expert/);
-  assert.match(rootText ?? "", /reviewer.*Read-only reviewer/);
+  assert.match(rootText ?? "", /reviewer.*Cannot edit files/);
+  assert.match(rootText ?? "", /cannot edit files, but bash and memory tools may remain/);
   assert.equal(await render(ROOT_CONVERSATION_ID + 1), undefined);
 });
 
@@ -328,7 +360,9 @@ test("worktree delegation branches from the parent HEAD and reuses its worktree 
     const childId = fixture.state.conversations[0].id;
     const identity = fixture.state.identities.get(childId)!;
     assert.ok(identity.worktree);
-    assert.equal(identity.worktree.branch, `durable/${childId}`);
+    assert.ok(identity.worktree.namespace);
+    assert.equal(identity.worktree.branch, `durable/${identity.worktree.namespace}`);
+    assert.equal(identity.worktree.path, join(`${identity.worktree.repoRoot}-durable`, identity.worktree.namespace));
     assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: identity.worktree.path, encoding: "utf8" }).trim(), parentHead);
     assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: identity.worktree.path, encoding: "utf8" }).trim(), identity.worktree.branch);
     assert.equal(fixture.state.agents.get(childId)?.cwd, identity.worktree.path);
@@ -343,6 +377,111 @@ test("worktree delegation branches from the parent HEAD and reuses its worktree 
     const listing = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
     assert.equal(listing.split("\n").filter((line) => line === `worktree ${identity.worktree!.path}`).length, 1);
     assert.equal(fixture.state.conversations.length, 1, "the recovered tool call does not create a duplicate conversation or worktree");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("worktree namespace isolates sessions that allocate the same child id", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-delegate-session-isolation-"));
+  try {
+    const repo = join(root, "repo");
+    await mkdir(repo, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: repo, stdio: "ignore" });
+    await writeFile(join(repo, "seed.txt"), "initial parent\n");
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "add", "seed.txt"], { cwd: repo, stdio: "ignore" });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"], { cwd: repo, stdio: "ignore" });
+    const firstHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    const extension = extensionForExperts();
+    const delegate = extension.tools?.find((tool) => tool.name === "delegate");
+    assert.ok(delegate);
+    const args = { expert: "backend-engineer", task: "Implement with isolated files.", worktree: true };
+
+    const firstSession = expertHarnessApi({ cwd: repo });
+    await delegate.execute(args as never, firstSession.api as never, context);
+    const firstIdentity = firstSession.state.identities.get(ROOT_CONVERSATION_ID + 1)!;
+    assert.ok(firstIdentity.worktree);
+    await writeFile(join(firstIdentity.worktree.path, "dirty-session-a.txt"), "belongs to session A");
+
+    await writeFile(join(repo, "next.txt"), "new parent commit\n");
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "add", "next.txt"], { cwd: repo, stdio: "ignore" });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "advance parent"], { cwd: repo, stdio: "ignore" });
+    const secondHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    assert.notEqual(firstHead, secondHead);
+
+    const secondSession = expertHarnessApi({ cwd: repo });
+    await delegate.execute(args as never, secondSession.api as never, context);
+    const secondIdentity = secondSession.state.identities.get(ROOT_CONVERSATION_ID + 1)!;
+    assert.ok(secondIdentity.worktree);
+    assert.equal(firstSession.state.conversations[0].id, secondSession.state.conversations[0].id, "session-local child IDs collide in this fixture");
+    assert.notEqual(firstIdentity.worktree.namespace, secondIdentity.worktree.namespace);
+    assert.notEqual(firstIdentity.worktree.path, secondIdentity.worktree.path);
+    assert.notEqual(firstIdentity.worktree.branch, secondIdentity.worktree.branch);
+    assert.equal(firstIdentity.worktree.baseCommit, firstHead);
+    assert.equal(secondIdentity.worktree.baseCommit, secondHead);
+    assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: secondIdentity.worktree.path, encoding: "utf8" }).trim(), secondHead);
+    assert.equal(await readFile(join(firstIdentity.worktree.path, "dirty-session-a.txt"), "utf8"), "belongs to session A");
+    await assert.rejects(readFile(join(secondIdentity.worktree.path, "dirty-session-a.txt")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("git worktree cancellation kills a slow post-checkout hook and replay reuses partial registration", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "dpi-delegate-hook-cancel-"));
+  try {
+    const repo = join(root, "repo");
+    const hookPids = join(root, "hook-pids.txt");
+    await mkdir(repo, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: repo, stdio: "ignore" });
+    await mkdir(join(repo, ".git", "hooks"), { recursive: true });
+    await writeFile(join(repo, "seed.txt"), "seed\n");
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "add", "seed.txt"], { cwd: repo, stdio: "ignore" });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], { cwd: repo, stdio: "ignore" });
+    const quotedPids = `'${hookPids.replaceAll("'", "'\\''")}'`;
+    await writeFile(join(repo, ".git", "hooks", "post-checkout"), [
+      "#!/bin/sh",
+      `if [ ! -f ${quotedPids} ]; then sleep 30 & child=$!; printf '%s %s\\n' "$$" "$child" > ${quotedPids}; wait; fi`,
+    ].join("\n"));
+    await chmod(join(repo, ".git", "hooks", "post-checkout"), 0o755);
+
+    const fixture = expertHarnessApi({ cwd: repo });
+    const extension = createExpertsExtension(fixtureClient(), {
+      maxChildren: 2,
+      childExtensions: ["coding-tools", "memory", "skills", "web"].map((name) => ({ name })) as never[],
+      gitTimeoutMs: 10_000,
+    });
+    const delegate = extension.tools?.find((tool) => tool.name === "delegate");
+    assert.ok(delegate);
+    const controller = new AbortController();
+    const args = { expert: "backend-engineer", task: "Implement with a cancellable worktree.", worktree: true };
+    const pending = delegate.execute(args as never, fixture.api as never, { abortSignal: controller.signal } as never);
+    await until(async () => {
+      try { await readFile(hookPids); return true; } catch { return false; }
+    }, 5_000, "post-checkout hook start");
+    const pids = (await readFile(hookPids, "utf8")).trim().split(/\s+/).map(Number);
+    assert.equal(pids.length, 2);
+    controller.abort();
+    await assert.rejects(pending, /cancel/i);
+    for (const pid of pids) {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        try { process.kill(pid, 0); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, `hook process ${pid} must be gone`);
+    }
+
+    await delegate.execute(args as never, fixture.api as never, context);
+    assert.equal(fixture.state.conversations.length, 1);
+    const identity = fixture.state.identities.get(ROOT_CONVERSATION_ID + 1)!;
+    assert.ok(identity.worktree);
+    const worktrees = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
+    assert.equal(worktrees.split("\n").filter((line) => line === `worktree ${identity.worktree!.path}`).length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -377,32 +516,24 @@ test("faux provider receives a fully configured durable reviewer child", async (
       PI_SETUP_DIR: setupDir,
     }, async () => {
       store = await temp.open();
-      const session = await store!.create({ name: "Expert integration", cwd: temp.work, model: faux });
-      const { row, h, c } = await store!.resolveAgent(session.id, "main");
+      const repo = join(temp.work, "project", "nested");
+      execFileSync("git", ["init", "-q"], { cwd: repo, stdio: "ignore" });
+      await writeFile(join(repo, "seed.txt"), "fixture repo\n");
+      execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "add", "seed.txt"], { cwd: repo, stdio: "ignore" });
+      execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"], { cwd: repo, stdio: "ignore" });
+      const session = await store!.create({ name: "Expert integration", cwd: "project/nested", model: faux });
+      const resolved = await store!.resolveAgent(session.id, "main");
+      const { row, h, c } = resolved;
+      await store!.configure(row, c, { readOnly: false });
       const ownerTaskId = await c.commit(
         (tx) => tx.createTask(HoldingTask, {}, { ownership: { kind: "conversation" } }),
         context,
       );
       cleanupOwner = () => h.abortTask(ownerTaskId, context).then(() => undefined);
 
-      const parent = await c.agent(context);
-      const delegate = parent.tools.find((tool) => tool.name === "delegate");
-      assert.ok(delegate);
-      const result = await delegate.execute(
-        { expert: "reviewer", task: "Review the current implementation." } as never,
-        {
-          taskId: ownerTaskId,
-          conversationId: c.id,
-          callId: "test-delegate",
-          agent: (ctx: typeof context) => c.agent(ctx),
-          commit: (change: (tx: Tx) => unknown, ctx: typeof context) => c.commit(change, ctx),
-          snapshot: (token: never, id: never, ctx: typeof context) => h.snapshot(token, id, ctx),
-          details: async () => {},
-          conversation: (id: never, ctx: typeof context) => h.conversation(id, ctx),
-        } as never,
-        context,
-      );
-      const details = result.details as { conversationId?: number } | undefined;
+      const taskArgs = { expert: "reviewer", task: "Review the current implementation.", worktree: true };
+      const result = await invokeDelegate(resolved, ownerTaskId, taskArgs, "test-delegate");
+      const details = result.details as { conversationId?: number; worktree?: string; branch?: string } | undefined;
       assert.ok(details?.conversationId);
       const child = await h.conversation(details.conversationId as never, context);
       assert.ok(child);
@@ -412,39 +543,83 @@ test("faux provider receives a fully configured durable reviewer child", async (
       assert.deepEqual(childAgent.extensions.map((extension) => extension.name), ["coding-tools", "memory", "skills", "web"]);
       assert.match(childAgent.instructions ?? "", /Review the work/);
       assert.match(childAgent.instructions ?? "", /Cite evidence/);
+      assert.equal(childAgent.cwd, details.worktree);
+      const identity = await h.snapshot(ExpertIdentity, child.id, context);
+      assert.deepEqual(identity?.excludedTools, ["edit", "write"]);
       const childDetail = await store!.agentDetail(row, child);
-      assert.equal(childDetail.config.readOnly, true);
-      for (const tool of childDetail.tools.filter((item) => item.writes)) assert.equal(tool.offered, false, tool.name);
+      assert.equal(childDetail.config.readOnly, false, "excluding edit/write does not make the reviewer fully read-only");
+      const offered = new Set(childDetail.tools.filter((tool) => tool.offered).map((tool) => tool.name));
+      for (const name of ["bash", "memory_note", "memory_rewrite"]) assert.ok(offered.has(name), `${name} remains available to reviewer`);
+      for (const name of ["edit", "write"]) assert.equal(offered.has(name), false, `${name} is excluded by profile`);
       const transcript = JSON.stringify(await store!.activeEntries(child));
       assert.match(transcript, /notes\/worked\.md — reviewed patterns/);
       assert.match(transcript, /codebase-design/);
       assert.match(result.content?.map((part) => part.type === "text" ? part.text : "").join(" ") ?? "", /Expert reviewer completed/);
 
+      // Simulate an upgrade which resets the ordinary tool selection; the durable profile exclusions must survive.
+      const upgradeEntry = await child.commit(async (tx) => {
+        const agent = await tx.doc(AgentDoc, child.id);
+        delete agent.tools;
+        return tx.appendEntry(child.id, { kind: "test.expert-profile-upgrade", data: {} });
+      }, context);
+      const forked = await store!.fork(row, child, { entryId: Number(upgradeEntry.id) });
+      const forkConversation = await h.conversation(forked.id as never, context);
+      assert.ok(forkConversation);
+      const forkDetail = await store!.agentDetail(row, forkConversation);
+      const forkOffered = new Set(forkDetail.tools.filter((tool) => tool.offered).map((tool) => tool.name));
+      for (const name of ["bash", "memory_note", "memory_rewrite"]) assert.ok(forkOffered.has(name), `${name} survives fork`);
+      for (const name of ["edit", "write"]) assert.equal(forkOffered.has(name), false, `${name} stays excluded on fork`);
+
       await store!.close();
       store = undefined;
-      cleanupOwner = undefined;
       store = await temp.open();
       const reopened = await store!.resolveAgent(session.id, "main");
       const childCountBeforeReplay = (await store!.agents(reopened.row)).length;
-      const reopenedParent = await reopened.c.agent(context);
-      const reopenedDelegate = reopenedParent.tools.find((tool) => tool.name === "delegate");
-      assert.ok(reopenedDelegate);
-      const replayed = await reopenedDelegate.execute(
-        { expert: "reviewer", task: "Review the current implementation." } as never,
-        {
-          taskId: ownerTaskId,
-          conversationId: reopened.c.id,
-          callId: "test-delegate-replay",
-          agent: (ctx: typeof context) => reopened.c.agent(ctx),
-          commit: (change: (tx: Tx) => unknown, ctx: typeof context) => reopened.c.commit(change, ctx),
-          snapshot: (token: never, id: never, ctx: typeof context) => reopened.h.snapshot(token, id, ctx),
-          details: async () => {},
-          conversation: (id: never, ctx: typeof context) => reopened.h.conversation(id, ctx),
-        } as never,
-        context,
-      );
+      const replayed = await invokeDelegate(reopened, ownerTaskId, taskArgs, "test-delegate-replay");
       assert.equal((replayed.details as { conversationId?: number } | undefined)?.conversationId, details.conversationId);
       assert.equal((await store!.agents(reopened.row)).length, childCountBeforeReplay, "restart replay reuses the durable child");
+      const reopenedChild = await reopened.h.conversation(details.conversationId as never, context);
+      const reopenedFork = await reopened.h.conversation(forked.id as never, context);
+      assert.ok(reopenedChild && reopenedFork);
+      for (const conversation of [reopenedChild!, reopenedFork!]) {
+        const reopenedDetail: Awaited<ReturnType<Store["agentDetail"]>> = await store!.agentDetail(reopened.row, conversation);
+        const reopenedOffered: Set<string> = new Set(reopenedDetail.tools.filter((tool) => tool.offered).map((tool) => tool.name));
+        assert.ok(reopenedOffered.has("bash"));
+        assert.ok(reopenedOffered.has("memory_note"));
+        assert.equal(reopenedOffered.has("edit"), false);
+        assert.equal(reopenedOffered.has("write"), false);
+      }
+      assert.equal((await store!.agentDetail(reopened.row, reopenedChild)).config.readOnly, false);
+      const worktrees = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
+      assert.equal(worktrees.split("\n").filter((line) => line === `worktree ${details.worktree}`).length, 1);
+      await reopened.h.abortTask(ownerTaskId, context);
+      cleanupOwner = undefined;
+
+      // A read-only root no longer offers delegate; invoke its registered callback to verify child policy inheritance.
+      const restrictedSession = await store!.create({ name: "Read-only parent", cwd: "project/nested", model: faux });
+      const restricted = await store!.resolveAgent(restrictedSession.id, "main");
+      await store!.configure(restricted.row, restricted.c, { readOnly: true });
+      assert.equal((await restricted.c.agent(context)).tools.some((tool) => tool.name === "delegate"), false);
+      const restrictedOwnerTask = await restricted.c.commit(
+        (tx) => tx.createTask(HoldingTask, {}, { ownership: { kind: "conversation" } }),
+        context,
+      );
+      cleanupOwner = () => restricted.h.abortTask(restrictedOwnerTask, context).then(() => undefined);
+      const restrictedResult = await invokeDelegate(
+        restricted,
+        restrictedOwnerTask,
+        { expert: "reviewer", task: "Review under inherited read-only policy." },
+        "test-restricted-delegate",
+      );
+      const restrictedId = (restrictedResult.details as { conversationId?: number }).conversationId;
+      assert.ok(restrictedId);
+      const restrictedChild = await restricted.h.conversation(restrictedId as never, context);
+      assert.ok(restrictedChild);
+      const restrictedDetail = await store!.agentDetail(restricted.row, restrictedChild);
+      assert.equal(restrictedDetail.config.readOnly, true);
+      for (const tool of restrictedDetail.tools.filter((item) => item.writes)) assert.equal(tool.offered, false, tool.name);
+      await cleanupOwner();
+      cleanupOwner = undefined;
     });
   } finally {
     await cleanupOwner?.().catch(() => {});

@@ -73,6 +73,7 @@ import { ADDON_INFO, createAddons, PROMPTS, PromptChecklist, type Addons } from 
 import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
 import { onboardEnabledFromEnv, onboardOptionsFromEnv, type OnboardOptions } from "./onboard/config.js";
 import { installOnboard } from "./onboard/index.js";
+import { ExpertIdentity } from "./onboard/experts.js";
 
 export const DURABLE_VERSION = "1.0.3";
 
@@ -611,7 +612,7 @@ export class Store {
       const addons = createAddons({ offline: this.options.provider === "faux" });
       for (const extension of addons.list) registry.install(extension);
       const onboardExtensions = this.onboardOptions
-        ? installOnboard(registry, this.onboardOptions, { childBaseExtensions: [CodingTools], writeTools: WRITE_TOOLS })
+        ? installOnboard(registry, this.onboardOptions, { childBaseExtensions: [CodingTools] })
         : [];
       const harness = await Harness.open(
         await openNodeSqliteStorage(row.dbPath),
@@ -627,6 +628,10 @@ export class Store {
               const policy = await tx.doc(ReadOnlyPolicy, c.id);
               policy.mode = inherited.mode;
               policy.previousTools = cloneToolSelection(inherited.previousTools);
+              if (inherited.mode === "read-only") {
+                const agent = await tx.doc(AgentDoc, c.id);
+                agent.tools = removeTools(agent.tools, [...WRITE_TOOLS]);
+              }
             }
           },
           settings: {
@@ -803,7 +808,11 @@ export class Store {
 
   private async reconcileReadOnlyPolicy(h: Harness, c: Conversation, migrateLegacy: boolean) {
     const existing = await h.snapshot(ReadOnlyPolicy, c.id, ctx);
-    if (existing?.mode === "read-write") return;
+    const identity = await h.snapshot(ExpertIdentity, c.id, ctx);
+    const excludedTools = Array.isArray(identity?.excludedTools)
+      ? identity.excludedTools.filter((name): name is string => typeof name === "string")
+      : [];
+    if (existing?.mode === "read-write" && excludedTools.length === 0) return;
 
     const { all } = await this.toolsOf(c);
     const writerNames = all.filter((tool) => WRITE_TOOLS.has(tool.name)).map((tool) => tool.name);
@@ -822,22 +831,27 @@ export class Store {
         };
       }
     }
-    if (!shouldApply) return;
+    if (!shouldApply && excludedTools.length === 0) return;
 
     await c.commit(async (tx) => {
       const agent = await tx.doc(AgentDoc, c.id);
       const policy = await tx.doc(ReadOnlyPolicy, c.id);
-      if (policy.mode !== "read-only") {
+      if (shouldApply && policy.mode !== "read-only") {
         policy.mode = "read-only";
         policy.previousTools = previousTools ?? saveToolSelection(agent.tools);
       }
-      agent.tools = removeTools(agent.tools, writerNames);
+      const denied = policy.mode === "read-only" ? [...excludedTools, ...writerNames] : excludedTools;
+      agent.tools = removeTools(agent.tools, denied);
     }, ctx);
   }
 
-  private async setReadOnlyPolicy(c: Conversation, enabled: boolean) {
+  private async setReadOnlyPolicy(h: Harness, c: Conversation, enabled: boolean) {
     const { all } = await this.toolsOf(c);
     const writerNames = all.filter((tool) => WRITE_TOOLS.has(tool.name)).map((tool) => tool.name);
+    const identity = await h.snapshot(ExpertIdentity, c.id, ctx);
+    const excludedTools = Array.isArray(identity?.excludedTools)
+      ? identity.excludedTools.filter((name): name is string => typeof name === "string")
+      : [];
     await c.commit(async (tx) => {
       const agent = await tx.doc(AgentDoc, c.id);
       const policy = await tx.doc(ReadOnlyPolicy, c.id);
@@ -855,6 +869,7 @@ export class Store {
         policy.mode = "read-write";
         policy.previousTools = { kind: "all" };
       }
+      agent.tools = removeTools(agent.tools, excludedTools);
     }, ctx);
   }
 
@@ -918,10 +933,12 @@ export class Store {
   }
 
   async fork(row: SessionRow, c: Conversation, body: { entryId?: unknown; name?: unknown }) {
+    const h = this.harness(row);
     const at = Number(body.entryId);
     if (!Number.isSafeInteger(at)) throw invalid("entryId is required");
     if (body.name !== undefined && typeof body.name !== "string") throw invalid("Invalid fork name");
     const fork = await c.fork(at as EntryId, { ownership: { kind: "ownerless" } }, ctx);
+    await this.reconcileReadOnlyPolicy(h, fork, this.onboardOptions !== undefined);
     const agent = await fork.agent(ctx);
     await fork.configure({ model: this.routedModel(agent.model) }, ctx);
     if (typeof body.name === "string" && body.name.trim()) this.setAgentName(row, fork.id as number, body.name);
@@ -950,7 +967,7 @@ export class Store {
       },
       ctx,
     );
-    if (body.readOnly !== undefined) await this.setReadOnlyPolicy(c, body.readOnly);
+    if (body.readOnly !== undefined) await this.setReadOnlyPolicy(this.harness(row), c, body.readOnly);
     if (model && (c.id as number) === 1)
       this.catalog.prepare("UPDATE sessions SET model=?,provider=? WHERE id=?").run(model.modelId, model.provider, row.id);
     // Thresholds are shared by the session's agents; refit them when this model's window is too small for them.

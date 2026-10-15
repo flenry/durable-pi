@@ -6,7 +6,7 @@ const DURABLE_EXPERT_GUIDANCE = `## Durable experts
 
 Only the root conversation may delegate. Use delegate(expert, task, { worktree? }) for a bounded task that benefits from specialist ownership; the child is durable, visible under this conversation, and interrupted with its parent. For code changes, request a worktree when isolation helps, then integrate the returned path and branch yourself. At the per-session live-child limit (default 2), delegation reports at capacity; retry after a child completes.
 
-Use a tier-shaped pipeline: a build expert implements first, QA verifies the resulting behavior next, and reviewer reviews last. Give each expert the acceptance criteria and relevant context; do not ask QA or reviewer to act before the build output exists. Experts own their own cross-project best practices; use the inbox only to suggest a learning for another expert. The host supplies expert identity, so never claim or pass actor or self in memory calls.`;
+Use a tier-shaped pipeline: a build expert implements first, QA verifies the resulting behavior next, and reviewer reviews last. Give each expert the acceptance criteria and relevant context; do not ask QA or reviewer to act before the build output exists. Expert tool exclusions are exact: a reviewer excluded from \`edit\` and \`write\` cannot edit files, but may still use bash and memory tools; do not describe that profile as fully read-only. A parent read-only policy still removes all writing tools. Experts own their own cross-project best practices; use the inbox only to suggest a learning for another expert. The host supplies expert identity, so never claim or pass actor or self in memory calls.`;
 
 export const BUILTIN_DURABLE_PLAYBOOK = `# Durable Orchestrator Playbook
 

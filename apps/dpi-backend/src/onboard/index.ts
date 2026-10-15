@@ -10,8 +10,6 @@ import { createWebExtension } from "./web.js";
 export interface OnboardInstallContext {
   /** Core capabilities that expert children need in addition to memory, skills, and web. */
   childBaseExtensions: readonly Extension[];
-  /** Canonical writer-tool names used to enforce read-only expert profiles. */
-  writeTools: ReadonlySet<string>;
 }
 
 /** Install the opt-in onboarding extensions and configure the exact base tools delegated experts inherit. */
@@ -28,7 +26,6 @@ export function installOnboard(registry: Registry, options: OnboardOptions, cont
     createExpertsExtension(client, {
       maxChildren: options.maxChildren,
       childExtensions: [...context.childBaseExtensions, memory, skills, web],
-      writeTools: context.writeTools,
     }),
   ];
   for (const extension of extensions) registry.install(extension);
