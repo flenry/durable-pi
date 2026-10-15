@@ -31,7 +31,7 @@ export async function selectReadyTicket(
 
 type SchedulerCheckpoint =
   | { phase: "wait"; nextAt: number }
-  | { phase: "record"; nextAt: number; hour?: string; ticketId?: string; runTaskId?: number };
+  | { phase: "record"; nextAt: number; hour?: string; ticketId?: string; runTaskId?: number; runToken?: string };
 interface SchedulerInput { device: string }
 interface SchedulerResult { stopped: boolean }
 type SchedulerRuntime = TaskRuntime<SchedulerInput, SchedulerCheckpoint, SchedulerResult, object>;
@@ -70,6 +70,7 @@ export function createTicketSchedulerTask(options: {
 
         let ticketId: string | undefined;
         let runTaskId: number | undefined;
+        let runToken: string | undefined;
         const tickets = await options.store.list();
         const active = tickets.find((ticket) => ticket.status === "in-progress" && ticket.device === options.device);
         if (!active) {
@@ -81,7 +82,8 @@ export function createTicketSchedulerTask(options: {
 
         await runtime.commit(async (tx) => {
           if (ticketId) {
-            runTaskId = await tx.createTask(options.runTask, { ticketId, device: options.device, runToken: randomUUID() }, {
+            runToken = randomUUID();
+            runTaskId = await tx.createTask(options.runTask, { ticketId, device: options.device, runToken }, {
               ownership: { kind: "conversation" },
               background: true,
             }) as number;
@@ -94,6 +96,7 @@ export function createTicketSchedulerTask(options: {
               hour,
               ...(ticketId ? { ticketId } : {}),
               ...(runTaskId ? { runTaskId } : {}),
+              ...(runToken ? { runToken } : {}),
             },
           };
         }, ctx);
@@ -102,7 +105,8 @@ export function createTicketSchedulerTask(options: {
         const checkpoint = task.state.checkpoint;
         if (checkpoint.hour) {
           await options.store.recordHour(checkpoint.hour);
-          if (checkpoint.ticketId) await options.store.log(checkpoint.ticketId, `scheduler started run task ${checkpoint.runTaskId ?? "(pending)"} for ${checkpoint.hour}`, now());
+          if (checkpoint.ticketId && checkpoint.runToken)
+            await options.store.runLog(checkpoint.ticketId, `scheduler started run task ${checkpoint.runTaskId ?? "(pending)"} for ${checkpoint.hour}`, now(), checkpoint.runToken);
         }
         await runtime.commit(() => ({
           status: "running",

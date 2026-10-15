@@ -13,6 +13,8 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { Harness, ROOT_CONVERSATION_ID, type TaskId } from "@earendil-works/pi-durable";
 import { Store, type StoreOptions } from "../src/store.js";
+import { toMarkdown, toTranscript } from "../../dpi-sdk/src/transcript.js";
+import type { WireEntry } from "../../dpi-sdk/src/api.js";
 import { ExpertIdentity } from "../src/onboard/experts.js";
 import { TicketStore, type Ticket, type TicketCheckpoint } from "../src/onboard/tickets.js";
 
@@ -223,7 +225,7 @@ function makeTicket(repo: string, id: string): Ticket {
 }
 
 function ticketStoreFor(store: Store): TicketStore {
-  return new TicketStore((mutate) => store.shared.transactAppState((state) => mutate(state as Record<string, unknown>)));
+  return new TicketStore((mutate) => store.shared.transactTicketState((state) => mutate(state as Record<string, unknown>)));
 }
 
 function rowTicketModel(options: {
@@ -299,7 +301,20 @@ test("ticket build resumes after Store close/reopen without duplicate children, 
       const running = await tickets.get(ticketId);
       assert.equal(running?.status, "in-progress");
       assert.ok(running?.runTaskId);
+      assert.ok(running?.runToken);
+      assert.equal(running?.worktreeReady, true, "checkout readiness is persisted before worker submission");
+      const originalRunToken = running.runToken as string;
       const taskId = running.runTaskId as TaskId;
+
+      // Mirrors a different session's ticket.run task being aborted before it claims: its token must
+      // not release or finalize the live original worker's lease.
+      const crossSessionStore = ticketStoreFor(store);
+      assert.equal(await crossSessionStore.block(ticketId, "unclaimed duplicate aborted", Date.now(), "unclaimed-session-token"), false);
+      assert.equal(await crossSessionStore.complete(ticketId, "https://example.invalid/stale", Date.now(), "unclaimed-session-token"), false);
+      assert.equal(await crossSessionStore.runLog(ticketId, "stale worker progress", Date.now(), "unclaimed-session-token"), false);
+      assert.equal((await crossSessionStore.get(ticketId))?.runToken, originalRunToken);
+      assert.equal((await crossSessionStore.claim("20261015-1031-next-ticket", "fixture-device", "queue-probe", 998, Date.now())).claimed, false,
+        "an unclaimed duplicate must not admit another task while the original worker is live");
       const beforeRestart = await h.getTask(taskId, context);
       const checkpoint = beforeRestart?.state as { status: string; checkpoint?: TicketCheckpoint };
       assert.equal(checkpoint.status, "running");
@@ -329,8 +344,14 @@ test("ticket build resumes after Store close/reopen without duplicate children, 
       const complete = await ticketStoreFor(store).get(ticketId);
       assert.equal(complete?.status, "done");
       assert.equal(complete?.pr, "https://github.com/example/project/pull/42");
+      await ticketStoreFor(store).update(ticketId, "ready", undefined, Date.now());
+      assert.equal((await ticketStoreFor(store).claim(ticketId, "fixture-device", "new-owner-token", 998, Date.now())).claimed, true);
+      assert.equal(await ticketStoreFor(store).complete(ticketId, "https://example.invalid/stale", Date.now(), originalRunToken), false,
+        "a stale completion cannot finalize a newer run after ownership changes");
+      assert.equal((await ticketStoreFor(store).get(ticketId))?.runToken, "new-owner-token");
+      assert.equal(await ticketStoreFor(store).block(ticketId, "release queue probe", Date.now(), "new-owner-token"), true);
       assert.deepEqual(await ticketStoreFor(store).claim("20261015-1031-next-ticket", "fixture-device", "queue-probe", 999, Date.now()), { claimed: true },
-        "completing the ticket releases the device queue");
+        "a matching owner can release the device queue");
 
       const finalTask = await reopenedHarness.getTask(taskId, context);
       const terminalState = finalTask?.state as { status: string; outcome?: { status: string; result?: { status?: string } } };
@@ -354,6 +375,56 @@ test("ticket build resumes after Store close/reopen without duplicate children, 
       assert.equal(worktrees.length, 1, "the ticket has exactly one registered worktree");
       const ghCalls = await readFile(ghLog, "utf8").catch(() => "");
       assert.equal(ghCalls.trim().split(/\r?\n/).filter(Boolean).length, 1, "fake gh creates exactly one PR");
+    });
+  } finally {
+    await store?.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legal unrelated App State growth cannot strand a faulted ticket run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-state-pressure-"));
+  const repo = await createLocalRepo(root);
+  const setupDir = await writeMemoryCliFixture(root);
+  const startDir = join(root, "projects");
+  await mkdir(startDir, { recursive: true });
+  const options = storeOptions(root, startDir);
+  const ticketId = "20261015-1030-state-pressure";
+  const gatePath = join(root, "hold-expert-cli");
+  const env = { DPI_ONBOARD: "1", DPI_MEMORY: "local", DPI_TICKETS: "0", PI_SETUP_DIR: setupDir, DPI_TEST_EXPERT_GATE: gatePath };
+  const buildCalls = new Map<string, number>();
+  let notifyFirstBuild!: () => void;
+  const firstBuildStarted = new Promise<void>((resolve) => { notifyFirstBuild = resolve; });
+  const responder = rowTicketModel({ ticketId, onFirstBuildStarted: () => notifyFirstBuild(), buildCalls });
+  let store: Store | undefined;
+  try {
+    await withEnvironment(env, async () => {
+      store = await Store.open(options);
+      installFakeModel(store, responder);
+      const session = await store.create({ name: "Ticket pressure fixture", cwd: repo, model: { provider: "faux", modelId: "echo" } });
+      const tickets = ticketStoreFor(store);
+      await tickets.list();
+      await tickets.add(makeTicket(repo, ticketId));
+      await tickets.add(makeTicket(repo, "20261015-1031-after-pressure"));
+      const { h, c } = await store.resolveAgent(session.id, "main");
+      const submission = await store.send(c, { content: "launch durable ticket", requestId: "launch-pressure-ticket" });
+      assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
+      await withTimeout(firstBuildStarted, 20_000, "ticket worker to start before state growth");
+      const running = await tickets.get(ticketId);
+      assert.equal(running?.status, "in-progress");
+      assert.ok(running?.runTaskId);
+
+      const payload = "x".repeat(86_000);
+      const appState = await store.shared.snapshot();
+      const operation = Object.hasOwn(appState.value, "unrelatedPayload") ? "update" : "create";
+      await store.shared.change({ operation, path: "/unrelatedPayload", value: payload });
+      assert.ok(JSON.stringify((await store.shared.snapshot()).value).length < 100_000,
+        "the unrelated payload remains legal under the App State limit");
+
+      await store.abortTask(h, running.runTaskId as number);
+      await waitUntil(async () => (await tickets.get(ticketId))?.status === "blocked", 10_000, "aborted ticket to release its lease under App State growth");
+      assert.deepEqual(await tickets.claim("20261015-1031-after-pressure", "fixture-device", "after-pressure", 1000, Date.now()), { claimed: true },
+        "the next ticket remains admissible after an aborted run under legal unrelated App State growth");
     });
   } finally {
     await store?.close().catch(() => {});
@@ -425,7 +496,11 @@ test("reminders fire once through the durable timer after Store restart and canc
       const reopenedRow = store.row(session.id);
       h = store.harness(reopenedRow);
       await waitUntil(async () => (await h.getTask(fireTask.id, context))?.state.status === "terminal", 5_000, "fired reminder task to finish");
-      assert.equal((await reminderEvents(store, session.id, fireInput.id)).length, 1, "the reminder appends one firing entry");
+      const fired = await reminderEvents(store, session.id, fireInput.id);
+      assert.equal(fired.length, 1, "the reminder appends one firing entry");
+      assert.equal((fired[0].data as { text?: string } | undefined)?.text, "fire after restart");
+      assert.match(toMarkdown(toTranscript([fired[0] as unknown as WireEntry])), /fire after restart/,
+        "ordinary transcript rendering must display the fired reminder message");
       await store.close();
       store = undefined;
       store = await Store.open(options);

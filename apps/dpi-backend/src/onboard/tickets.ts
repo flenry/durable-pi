@@ -21,7 +21,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { messageText } from "../../../dpi-sdk/src/transcript.js";
 import type { AppState } from "../../../dpi-sdk/src/app-state.js";
 import { runBoundedProcess, type BoundedProcessResult } from "./bounded-process.js";
-import { durableThinkingLevel, ExpertIdentity } from "./experts.js";
+import { assertPristineWorktree, durableThinkingLevel, ExpertIdentity } from "./experts.js";
 import { normalizeRemote } from "./project-key.js";
 import type { MemoryClient } from "./memory-client.js";
 import { createTicketSchedulerTask } from "./scheduler.js";
@@ -58,6 +58,8 @@ export interface Ticket {
   pr?: string;
   branch?: string;
   worktree?: string;
+  worktreeReady?: boolean;
+  worktreeBaseCommit?: string;
   blockedNote?: string;
   runTaskId?: number;
   runToken?: string;
@@ -85,6 +87,9 @@ const PROCESS_OUTPUT_LIMIT = 1_000_000;
 const MAX_TICKETS = 200;
 const MAX_LOG_LINES = 20;
 const MAX_TICKET_STATE_CHARS = 85_000;
+// Every ordinary write leaves room for an atomic blocked transition to record its note and clear the lease.
+const TICKET_STATE_RECOVERY_HEADROOM = 5_000;
+const MAX_TICKET_PR_URL_CHARS = 2_000;
 const HOUR_HISTORY = 168;
 
 export const boundedRunner: ProcessRunner = (command, args, options) =>
@@ -121,12 +126,13 @@ function appendLog(ticket: Ticket, text: string, now: number | Date) {
   ticket.updatedAt = at;
 }
 
-/** Device-wide ticket persistence and queue invariants, backed by one atomic App State transaction. */
+/** Device-wide ticket persistence and queue invariants, backed by one atomic ticket-state transaction. */
 export class TicketStore {
   constructor(private readonly apply: <T>(change: (state: Record<string, unknown>) => T) => Promise<T>) {}
 
-  private transact<T>(change: (state: Record<string, unknown>) => T): Promise<T> {
+  private transact<T>(change: (state: Record<string, unknown>) => T, recovery = false): Promise<T> {
     return this.apply((state) => {
+      const before = JSON.stringify(state);
       const result = change(state);
       const raw = state[TICKETS_STATE_KEY];
       if (raw !== undefined) {
@@ -134,12 +140,25 @@ export class TicketStore {
         for (const ticket of Object.values(doc.tickets)) {
           if (ticket.log.length > MAX_LOG_LINES) ticket.log.splice(0, ticket.log.length - MAX_LOG_LINES);
         }
-        while (JSON.stringify(state).length > MAX_TICKET_STATE_CHARS) {
-          const oldestDone = Object.values(doc.tickets)
-            .filter((ticket) => ticket.status === "done")
-            .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
-          if (!oldestDone) throw new Error("Ticket queue reached the durable App State size limit; complete or prune a ticket first");
-          delete doc.tickets[oldestDone.id];
+        let encoded = JSON.stringify(state);
+        const limit = recovery ? MAX_TICKET_STATE_CHARS : MAX_TICKET_STATE_CHARS - TICKET_STATE_RECOVERY_HEADROOM;
+        if (encoded !== before) {
+          while (encoded.length > limit) {
+            const oldestDone = Object.values(doc.tickets)
+              .filter((ticket) => ticket.status === "done")
+              .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
+            if (oldestDone) delete doc.tickets[oldestDone.id];
+            else {
+              // History is expendable; retain queue state and its lease before rejecting a bounded write.
+              const oldestLog = Object.values(doc.tickets)
+                .filter((ticket) => ticket.log.length > 0)
+                .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
+              if (!oldestLog) throw new Error("Ticket queue reached its durable state limit; complete or prune a ticket first");
+              oldestLog.log.shift();
+            }
+            encoded = JSON.stringify(state);
+          }
+          if (encoded.length > limit) throw new Error("Ticket queue reached its durable state limit; complete or prune a ticket first");
         }
       }
       return result;
@@ -212,45 +231,77 @@ export class TicketStore {
     });
   }
 
-  async block(id: string, note: string, now: number): Promise<void> {
-    await this.transact((state) => {
+  async block(id: string, note: string, now: number, runToken: string): Promise<boolean> {
+    return this.transact((state) => {
       const ticket = ticketState(state).tickets[id];
-      if (!ticket) return;
+      if (!ticket || ticket.status !== "in-progress" || ticket.runToken !== runToken) return false;
       ticket.status = "blocked";
       ticket.blockedNote = note.slice(0, 1000);
       delete ticket.runTaskId;
       delete ticket.runToken;
       appendLog(ticket, `blocked: ${note}`, now);
-    });
+      return true;
+    }, true);
   }
 
-  async complete(id: string, pr: string, now: number): Promise<void> {
-    await this.transact((state) => {
+  async complete(id: string, pr: string, now: number, runToken: string): Promise<boolean> {
+    return this.transact((state) => {
       const ticket = ticketState(state).tickets[id];
       if (!ticket) throw new Error(`No ticket ${id}`);
+      if (ticket.status !== "in-progress" || ticket.runToken !== runToken) return false;
+      if (pr.length > MAX_TICKET_PR_URL_CHARS) throw new Error("Pull request URL is too long");
       ticket.status = "done";
       ticket.pr = pr;
       delete ticket.blockedNote;
       delete ticket.runTaskId;
       delete ticket.runToken;
       appendLog(ticket, `PR opened: ${pr}`, now);
-    });
+      return true;
+    }, true);
   }
 
-  async setWorktree(id: string, branch: string, worktree: string, now: number): Promise<void> {
-    await this.transact((state) => {
+  async setWorktree(
+    id: string,
+    branch: string,
+    worktree: string,
+    now: number,
+    runToken: string,
+    ready: boolean,
+    baseCommit: string,
+  ): Promise<boolean> {
+    return this.transact((state) => {
       const ticket = ticketState(state).tickets[id];
-      if (!ticket) throw new Error(`No ticket ${id}`);
+      if (!ticket || ticket.status !== "in-progress" || ticket.runToken !== runToken) return false;
       ticket.branch = branch;
       ticket.worktree = worktree;
-      appendLog(ticket, `worktree ready: ${worktree} (${branch})`, now);
+      ticket.worktreeReady = ready;
+      ticket.worktreeBaseCommit = baseCommit;
+      if (ready) appendLog(ticket, `worktree ready: ${worktree} (${branch})`, now);
+      else ticket.updatedAt = new Date(now).toISOString();
+      return true;
     });
   }
 
   async log(id: string, message: string, now: number): Promise<void> {
     await this.transact((state) => {
       const ticket = ticketState(state).tickets[id];
-      if (ticket) appendLog(ticket, message, now);
+      if (ticket && ticket.status !== "in-progress") appendLog(ticket, message, now);
+    });
+  }
+
+  async runLog(id: string, message: string, now: number, runToken: string): Promise<boolean> {
+    return this.transact((state) => {
+      const ticket = ticketState(state).tickets[id];
+      if (!ticket || ticket.status !== "in-progress" || ticket.runToken !== runToken) return false;
+      appendLog(ticket, message, now);
+      return true;
+    });
+  }
+
+  async ownsRun(id: string, runToken: string): Promise<boolean> {
+    return this.transact((state) => {
+      const ticket = ticketState(state).tickets[id];
+      return ticket?.status === "in-progress" && ticket.runToken === runToken;
     });
   }
 
@@ -272,6 +323,32 @@ export class TicketStore {
 
 export function isTicketWorkPath(value: string): boolean {
   return value.toLowerCase().split(/[\\/]+/).some((segment) => ["work", "work-laptop", "office"].includes(segment));
+}
+
+async function canonicalFuturePath(value: string): Promise<string> {
+  const missing: string[] = [];
+  let existing = resolve(value);
+  for (;;) {
+    try {
+      const canonical = await realpath(existing);
+      return resolve(canonical, ...missing.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+        throw new Error(`cannot validate ticket worktree path ${value}: ${shortError(error)}`);
+      const parent = dirname(existing);
+      if (parent === existing) throw new Error(`cannot find an existing ancestor for ticket worktree path ${value}`);
+      missing.push(basename(existing));
+      existing = parent;
+    }
+  }
+}
+
+export async function assertTicketWorktreePath(value: string): Promise<string> {
+  if (!isAbsolute(value)) throw new Error(`ticket worktree path must be absolute: ${value}`);
+  if (isTicketWorkPath(value)) throw new Error(`work repos are excluded from ticket worktrees: ${value}`);
+  const canonical = await canonicalFuturePath(value);
+  if (isTicketWorkPath(canonical)) throw new Error(`work repos are excluded from ticket worktrees: ${canonical}`);
+  return canonical;
 }
 
 export function slugifyTicketTitle(title: string): string {
@@ -380,7 +457,7 @@ export function buildPullRequestBody(ticket: Ticket, checks: string[]): string {
 }
 
 export interface TicketStateHost {
-  transactAppState<T>(change: (state: AppState) => T): Promise<T>;
+  transactTicketState<T>(change: (state: AppState) => T): Promise<T>;
 }
 
 export interface TicketExtensionOptions {
@@ -512,7 +589,13 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
     initial: () => ({ phase: "prepare", sliceIndex: 0, children: {}, attempts: {}, checks: [] }),
     phases: {
       prepare: async (task, runtime, ctx) => {
+        if (runtime.signal.aborted) return;
         const claim = await store.claim(task.input.ticketId, task.input.device, task.input.runToken, task.id as number, now());
+        if (runtime.signal.aborted) {
+          if (claim.claimed)
+            await store.block(task.input.ticketId, "run was aborted before preparation began", now(), task.input.runToken);
+          return;
+        }
         if (!claim.claimed) {
           await runtime.commit(() => ({
             status: "terminal",
@@ -521,24 +604,36 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
           return;
         }
         try {
+          if (runtime.signal.aborted) return;
+          if (!(await store.ownsRun(task.input.ticketId, task.input.runToken)))
+            return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
           const ticket = await store.get(task.input.ticketId);
           if (!ticket) throw new Error(`No ticket ${task.input.ticketId}`);
           const problem = await validateTicketRepo(ticket.repo, process, runtime.signal);
           if (problem) throw new Error(problem);
-          const worktree = await prepareTicketWorktree(ticket, process, runtime.signal);
-          await store.setWorktree(ticket.id, worktree.branch, worktree.worktree, now());
+          const worktree = await prepareTicketWorktree(ticket, process, runtime.signal, async (preparing) => {
+            const recorded = await store.setWorktree(
+              ticket.id, preparing.branch, preparing.worktree, now(), task.input.runToken, false, preparing.baseCommit,
+            );
+            if (!recorded) throw new Error("ticket run ownership was lost before worktree preparation");
+          });
+          const ready = await store.setWorktree(
+            ticket.id,
+            worktree.branch,
+            worktree.worktree,
+            now(),
+            task.input.runToken,
+            true,
+            ticket.worktreeBaseCommit ?? worktree.baseCommit,
+          );
+          if (!ready) throw new Error("ticket run ownership was lost before worktree readiness was recorded");
           await runtime.commit(() => ({
             status: "running",
             checkpoint: { ...task.state.checkpoint, phase: "build", worktree: worktree.worktree, branch: worktree.branch },
           }), ctx);
         } catch (error) {
           if (runtime.signal.aborted) return;
-          const note = `prepare failed: ${shortError(error)}`;
-          await store.block(task.input.ticketId, note, now());
-          await runtime.commit(() => ({
-            status: "terminal",
-            outcome: { status: "completed", result: { ticketId: task.input.ticketId, status: "blocked", message: note } },
-          }), ctx);
+          await blockRun(task, runtime, ctx, store, `prepare failed: ${shortError(error)}`, now());
         }
       },
       build: async (task, runtime, ctx) => {
@@ -548,6 +643,8 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
         await runPlanPhase("qa", (ticket) => ticket.plan.filter(isQa), task, runtime, ctx, store, options, process, now, childExtensionNames);
       },
       review: async (task, runtime, ctx) => {
+        if (!(await store.ownsRun(task.input.ticketId, task.input.runToken)))
+          return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
         const ticket = await store.get(task.input.ticketId);
         if (!ticket) return blockRun(task, runtime, ctx, store, `Ticket ${task.input.ticketId} disappeared`, now());
         const planned = ticket.plan.filter(isReviewer);
@@ -564,12 +661,16 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
       },
       pr: async (task, runtime, ctx) => {
         try {
+          if (!(await store.ownsRun(task.input.ticketId, task.input.runToken)))
+            return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
           const ticket = await store.get(task.input.ticketId);
-          if (!ticket || !task.state.checkpoint.worktree || !task.state.checkpoint.branch) throw new Error("Ticket worktree is missing");
-          const wt = task.state.checkpoint.worktree;
+          if (!ticket || !ticket.worktreeReady || !task.state.checkpoint.worktree || !task.state.checkpoint.branch)
+            throw new Error("Ticket worktree is missing or not ready");
+          const wt = await assertTicketWorktreePath(task.state.checkpoint.worktree);
           const branch = task.state.checkpoint.branch;
           const pr = await openTicketPullRequest(ticket, wt, branch, task.state.checkpoint.checks, process, runtime.signal);
-          await store.log(ticket.id, `pull request ready: ${pr}`, now());
+          if (!(await store.runLog(ticket.id, `pull request ready: ${pr}`, now(), task.input.runToken)))
+            return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
           await runtime.commit(() => ({
             status: "running",
             checkpoint: { ...task.state.checkpoint, phase: "done", pr },
@@ -580,12 +681,15 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
         }
       },
       done: async (task, runtime, ctx) => {
+        if (!(await store.ownsRun(task.input.ticketId, task.input.runToken)))
+          return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
         const ticket = await store.get(task.input.ticketId);
         const pr = task.state.checkpoint.pr ?? ticket?.pr;
         if (!ticket || !pr) return blockRun(task, runtime, ctx, store, "Ticket PR URL is missing", now());
         try {
           await recordHistory(memory, ticket, pr, process, runtime.signal);
-          await store.complete(ticket.id, pr, now());
+          const completed = await store.complete(ticket.id, pr, now(), task.input.runToken);
+          if (!completed) return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
           await runtime.commit(() => ({
             status: "terminal",
             outcome: { status: "completed", result: { ticketId: ticket.id, status: "done", pr } },
@@ -597,7 +701,7 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
       },
     },
     abort: async (task, runtime, ctx) => {
-      await store.block(task.input.ticketId, "run was aborted; inspect the log, then set the ticket ready to retry", now());
+      await store.block(task.input.ticketId, "run was aborted; inspect the log, then set the ticket ready to retry", now(), task.input.runToken);
       await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "Ticket run aborted" } }), ctx);
     },
   });
@@ -659,10 +763,12 @@ async function blockRun(
   note: string,
   now: number,
 ) {
-  await store.block(task.input.ticketId, note, now);
+  const blocked = await store.block(task.input.ticketId, note, now, task.input.runToken);
   await runtime.commit(() => ({
     status: "terminal",
-    outcome: { status: "completed", result: { ticketId: task.input.ticketId, status: "blocked", message: note } },
+    outcome: { status: "completed", result: blocked
+      ? { ticketId: task.input.ticketId, status: "blocked", message: note }
+      : { ticketId: task.input.ticketId, status: "already-running", message: "Ticket run no longer owns the queue" } },
   }), ctx);
 }
 
@@ -693,10 +799,20 @@ async function runPlanPhase(
   now: () => number,
   childExtensionNames: string[],
 ) {
+  if (!(await store.ownsRun(task.input.ticketId, task.input.runToken)))
+    return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
   const ticket = await store.get(task.input.ticketId);
   if (!ticket) return blockRun(task, runtime, ctx, store, `Ticket ${task.input.ticketId} disappeared`, now());
+  const checkpoint = task.state.checkpoint;
+  if (!ticket.worktreeReady || !checkpoint.worktree || ticket.worktree !== checkpoint.worktree)
+    return blockRun(task, runtime, ctx, store, "Ticket worktree readiness was not persisted; refusing worker submission", now());
+  try {
+    await assertTicketWorktreePath(checkpoint.worktree);
+  } catch (error) {
+    return blockRun(task, runtime, ctx, store, `Ticket worktree path refused: ${shortError(error)}`, now());
+  }
   const slices = slicesFor(ticket);
-  const cp = task.state.checkpoint;
+  const cp = checkpoint;
   if (cp.sliceIndex >= slices.length) {
     const next: TicketCheckpoint["phase"] = phase === "build" ? "qa" : phase === "qa" ? "review" : "pr";
     await advance(task, runtime, ctx, next, cp);
@@ -716,7 +832,10 @@ async function runPlanPhase(
     options.nameConversation?.(childId, slice.expert);
     const handle = await runtime.conversation(childId as ConversationId, ctx);
     if (!handle) throw new Error(`Ticket worker ${slice.expert} is unavailable`);
-    const prompt = ticketSlicePrompt(ticket, slice, phase, cp.worktree ?? ticket.worktree ?? ticket.repo, cp.branch ?? ticket.branch ?? "");
+    if (!(await store.ownsRun(ticket.id, task.input.runToken)))
+      return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
+    await assertTicketWorktreePath(checkpoint.worktree);
+    const prompt = ticketSlicePrompt(ticket, slice, phase, checkpoint.worktree, cp.branch ?? ticket.branch ?? "");
     const attempt = cp.attempts?.[slice.id] ?? 0;
     const requestId = `ticket:${ticket.id}:${phase}:${slice.id}${attempt ? `:retry-${attempt}` : ""}`;
     const settled = await (await handle.submit({ type: "input", content: prompt, requestId }, ctx)).wait(ctx);
@@ -735,9 +854,15 @@ async function runPlanPhase(
     const blocked = ticketBlocker(result);
     if (blocked) throw new Error(blocked);
     if (!ticketCompleted(result)) throw new Error(`Worker ${slice.expert} did not confirm completion with TICKET_STATUS: COMPLETE`);
-    await store.log(ticket.id, `${phase} slice ${slice.id} (${slice.expert}) completed`, now());
+    if (!(await store.ownsRun(ticket.id, task.input.runToken)))
+      return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
+    if (!(await store.runLog(ticket.id, `${phase} slice ${slice.id} (${slice.expert}) completed`, now(), task.input.runToken)))
+      return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
     const checks = ticketChecks(result);
-    for (const check of checks) await store.log(ticket.id, `${phase} check: ${check}`, now());
+    for (const check of checks) {
+      if (!(await store.runLog(ticket.id, `${phase} check: ${check}`, now(), task.input.runToken)))
+        return blockRun(task, runtime, ctx, store, "Ticket run no longer owns the queue", now());
+    }
     const nextCheckpoint: TicketCheckpoint = { ...cp, sliceIndex: cp.sliceIndex + 1, checks: [...new Set([...cp.checks, ...checks])] };
     await runtime.commit(() => ({ status: "running", checkpoint: nextCheckpoint }), ctx);
   } catch (error) {
@@ -818,36 +943,55 @@ function ticketSlicePrompt(ticket: Ticket, slice: TicketSlice, phase: string, wo
   ].join("\n\n");
 }
 
-export async function prepareTicketWorktree(ticket: Ticket, process: ProcessRunner = boundedRunner, signal?: AbortSignal) {
+export async function prepareTicketWorktree(
+  ticket: Ticket,
+  process: ProcessRunner = boundedRunner,
+  signal?: AbortSignal,
+  onPreparing?: (worktree: { worktree: string; branch: string; base: string; baseCommit: string }) => Promise<void>,
+): Promise<{ worktree: string; branch: string; base: string; baseCommit: string }> {
   const branch = ticket.branch ?? `ticket/${ticket.id}`;
   let repoParent = dirname(ticket.repo);
   try { repoParent = await realpath(repoParent); } catch {}
-  const worktree = ticket.worktree ?? join(repoParent, `${basename(ticket.repo)}-tickets`, ticket.id);
+  const requestedPath = ticket.worktree ?? join(repoParent, `${basename(ticket.repo)}-tickets`, ticket.id);
+  const worktree = await assertTicketWorktreePath(requestedPath);
   await process("git", ["fetch", "--quiet", "origin"], { cwd: ticket.repo, signal });
   const defaultBranch = (await process("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], { cwd: ticket.repo, signal })).stdout.trim();
   if (!defaultBranch.startsWith("origin/")) throw new Error("origin/HEAD does not identify the origin default branch");
+  const baseCommit = (await process("git", ["rev-parse", "--verify", `${defaultBranch}^{commit}`], { cwd: ticket.repo, signal })).stdout.trim();
   const listing = (await process("git", ["worktree", "list", "--porcelain"], { cwd: ticket.repo, signal })).stdout;
-  const registered = (await Promise.all(listing.split(/\r?\n\r?\n/).map(async (entry) => {
+  const registered: { path: string; ref: string | undefined }[] = [];
+  for (const entry of listing.split(/\r?\n\r?\n/)) {
     const path = entry.split(/\r?\n/).find((line) => line.startsWith("worktree "))?.slice(9);
     const ref = entry.split(/\r?\n/).find((line) => line.startsWith("branch "))?.slice(7);
-    if (!path) return undefined;
-    let canonical = resolve(path);
-    try { canonical = await realpath(canonical); } catch {}
-    return { path: canonical, ref };
-  }))).filter((entry): entry is { path: string; ref: string | undefined } => entry !== undefined);
-  let expectedPath = resolve(worktree);
-  try { expectedPath = await realpath(expectedPath); } catch {}
-  const existing = registered.find((entry) => entry.path === expectedPath);
-  if (existing) {
-    if (existing.ref !== `refs/heads/${branch}`) throw new Error(`Ticket worktree ${worktree} is attached to a different branch`);
-    return { worktree, branch, base: "(existing worktree)" };
+    if (path) registered.push({ path: await canonicalFuturePath(path), ref });
   }
+  const existing = registered.find((entry) => entry.path === worktree);
+  // Older runs persisted worktree/branch only after checkout completed, so keep their already-started workers resumable.
+  const legacyReady = ticket.worktreeReady === undefined && Boolean(ticket.worktree && ticket.branch);
+  const ready = ticket.worktreeReady === true || legacyReady;
+  const readGit = async (cwd: string, args: string[]) =>
+    (await process("git", args, { cwd, signal })).stdout.trim();
+  const prep = { worktree, branch, base: defaultBranch, baseCommit };
+  if (existing) {
+    await assertTicketWorktreePath(existing.path);
+    if (existing.ref !== `refs/heads/${branch}`) throw new Error(`Ticket worktree ${worktree} is attached to a different branch`);
+    if (!ready) {
+      await onPreparing?.(prep);
+      await assertPristineWorktree(worktree, ticket.worktreeBaseCommit ?? baseCommit, readGit, "ticket worktree");
+    }
+    return { ...prep, base: "(existing worktree)" };
+  }
+  if (ready) throw new Error(`Ticket worktree ${worktree} was marked ready but is no longer registered`);
   if (existsSync(worktree)) throw new Error(`Ticket worktree path exists but is not registered: ${worktree}`);
+  await onPreparing?.(prep);
   const branchList = (await process("git", ["branch", "--list", branch], { cwd: ticket.repo, signal })).stdout.trim();
   await import("node:fs/promises").then(({ mkdir }) => mkdir(dirname(worktree), { recursive: true }));
+  await assertTicketWorktreePath(worktree);
+  if (existsSync(worktree)) throw new Error(`Ticket worktree path exists but is not registered: ${worktree}`);
   if (branchList) await process("git", ["worktree", "add", worktree, branch], { cwd: ticket.repo, signal });
-  else await process("git", ["worktree", "add", "-b", branch, worktree, defaultBranch], { cwd: ticket.repo, signal });
-  return { worktree, branch, base: defaultBranch };
+  else await process("git", ["worktree", "add", "-b", branch, worktree, baseCommit], { cwd: ticket.repo, signal });
+  await assertPristineWorktree(worktree, ticket.worktreeBaseCommit ?? baseCommit, readGit, "ticket worktree");
+  return prep;
 }
 
 export async function openTicketPullRequest(
@@ -903,7 +1047,7 @@ async function recordHistory(memory: MemoryClient, ticket: Ticket, pr: string, p
 export function createTicketsExtension(host: TicketStateHost, options: TicketExtensionOptions): Extension {
   const now = options.now ?? Date.now;
   const process = options.process ?? boundedRunner;
-  const store = new TicketStore((mutate) => host.transactAppState((state) => mutate(state as Record<string, unknown>)));
+  const store = new TicketStore((mutate) => host.transactTicketState((state) => mutate(state as Record<string, unknown>)));
   const runTask = createTicketRunTask(store, options);
   const schedulerTask = createTicketSchedulerTask({
     store,

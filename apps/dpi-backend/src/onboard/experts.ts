@@ -219,6 +219,18 @@ function listedWorktrees(output: string): { path: string; branch?: string }[] {
   }).filter((entry): entry is { path: string; branch?: string } => entry !== undefined);
 }
 
+export async function assertPristineWorktree(
+  path: string,
+  expectedHead: string,
+  git: (cwd: string, args: string[]) => Promise<string>,
+  label = "worktree",
+): Promise<void> {
+  const head = await git(path, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  const status = await git(path, ["status", "--porcelain", "--untracked-files=all"]);
+  if (head !== expectedHead || status)
+    throw new Error(`${label} checkout is incomplete at ${path}; refusing to submit the child`);
+}
+
 /** Ensure only the namespace persisted with this delegation can be reused or repaired. */
 async function ensureWorktree(
   worktree: ExpertWorktree,
@@ -233,12 +245,12 @@ async function ensureWorktree(
   const expectedRef = `refs/heads/${worktree.branch}`;
   const listing = listedWorktrees(await git(worktree.repoRoot, ["worktree", "list", "--porcelain"], ctx));
   const existing = listing.find((entry) => entry.path === expectedPath);
-  const verifyPreparedCheckout = async () => {
-    const head = await git(expectedPath, ["rev-parse", "--verify", "HEAD^{commit}"], ctx);
-    const status = await git(expectedPath, ["status", "--porcelain", "--untracked-files=all"], ctx);
-    if (head !== worktree.baseCommit || status)
-      throw new Error(`delegate worktree checkout is incomplete at ${expectedPath}; refusing to submit the child`);
-  };
+  const verifyPreparedCheckout = () => assertPristineWorktree(
+    expectedPath,
+    worktree.baseCommit,
+    (cwd, args) => git(cwd, args, ctx),
+    "delegate worktree",
+  );
   if (existing) {
     if (existing.branch !== expectedRef) throw new Error(`delegate worktree ${expectedPath} is attached to a different branch`);
     if (!ready) await verifyPreparedCheckout();

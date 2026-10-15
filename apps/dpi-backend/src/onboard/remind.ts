@@ -64,7 +64,7 @@ function createReminderTask(now: () => number, timer?: (deadline: number, signal
           item.firedAt = now();
           await tx.appendEntry(task.conversationId, {
             kind: "dpi.reminder",
-            data: { id: item.id, message: item.message, scheduledAt: item.when, firedAt: item.firedAt },
+            data: { id: item.id, message: item.message, text: item.message, scheduledAt: item.when, firedAt: item.firedAt },
           });
           return { status: "terminal", outcome: { status: "completed", result: { id: item.id, fired: true } } };
         }, ctx);

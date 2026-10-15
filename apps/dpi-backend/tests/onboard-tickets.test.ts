@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { parseReminderWhen } from "../src/onboard/remind.js";
+import { toMarkdown, toTranscript } from "../../dpi-sdk/src/transcript.js";
 import {
+  boundedRunner,
   buildPullRequestBody,
   completedTicketSlices,
   isTicketWorkPath,
@@ -15,6 +18,7 @@ import {
   openTicketPullRequest,
   prepareTicketWorktree,
   TicketStore,
+  TICKETS_STATE_KEY,
   ticketBlocker,
   ticketChecks,
   ticketCompleted,
@@ -24,6 +28,7 @@ import {
   type TicketPlan,
 } from "../src/onboard/tickets.js";
 import { hourStamp, nextTopOfHour, selectReadyTicket } from "../src/onboard/scheduler.js";
+import { SharedState } from "../src/shared-state.js";
 
 const now = Date.parse("2026-10-15T10:30:00.000Z");
 
@@ -72,12 +77,64 @@ test("ticket store atomically claims at most one device ticket and releases bloc
   await assert.rejects(store.update("20261015-1030-retry-login", "done", "cancel", now), /in progress/);
   await assert.rejects(store.update("20261015-1031-next", "in-progress", undefined, now), /durable run/);
 
-  await store.block("20261015-1030-retry-login", "Need credentials", now + 1000);
+  await store.block("20261015-1030-retry-login", "Need credentials", now + 1000, "run-a");
   const next = await store.claim("20261015-1031-next", "command-center", "run-d", 103, now + 2000);
   assert.equal(next.claimed, true, "a blocked ticket must not hold the queue");
   const blocked = await store.get("20261015-1030-retry-login");
   assert.equal(blocked?.status, "blocked");
   assert.equal(blocked?.blockedNote, "Need credentials");
+});
+
+test("run-owned mutations are fenced by the active token and status", async () => {
+  let state: Record<string, unknown> = {};
+  const store = new TicketStore(async (mutate) => mutate(state));
+  const id = "20261015-1030-retry-login";
+  await store.add(ticket());
+  assert.equal((await store.claim(id, "command-center", "run-original", 101, now)).claimed, true);
+
+  assert.equal(await store.block(id, "duplicate aborted before claim", now + 1, "run-unclaimed"), false);
+  assert.equal(await store.complete(id, "https://example.invalid/pr/1", now + 1, "run-unclaimed"), false);
+  assert.equal(await store.setWorktree(id, "ticket/test", "/tmp/ticket-test", now + 1, "run-unclaimed", true, "base"), false);
+  assert.equal(await store.runLog(id, "stale progress", now + 1, "run-unclaimed"), false);
+  assert.equal((await store.get(id))?.status, "in-progress");
+  assert.equal((await store.get(id))?.runToken, "run-original");
+
+  assert.equal(await store.block(id, "original blocked", now + 2, "run-original"), true);
+  await store.update(id, "ready", undefined, now + 3);
+  assert.equal((await store.claim(id, "command-center", "run-new", 202, now + 4)).claimed, true);
+  assert.equal(await store.complete(id, "https://example.invalid/stale", now + 5, "run-original"), false);
+  assert.equal((await store.get(id))?.status, "in-progress");
+  assert.equal((await store.get(id))?.runToken, "run-new");
+});
+
+test("legacy ticket state migrates atomically out of user-editable App State", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-migration-"));
+  const shared = await SharedState.open(join(root, "state.sqlite"));
+  const id = "legacy-ticket";
+  try {
+    await shared.initialize({});
+    await shared.change({
+      operation: "create",
+      path: `/${TICKETS_STATE_KEY}`,
+      value: { version: 1, tickets: { [id]: ticket({ id }) }, processedHours: [] } as never,
+    });
+    const before = await shared.snapshot();
+    const tickets = new TicketStore((mutate) => shared.transactTicketState((state) => mutate(state as Record<string, unknown>)));
+    assert.equal((await tickets.get(id))?.id, id);
+    const after = await shared.snapshot();
+    assert.equal(Object.hasOwn(after.value, TICKETS_STATE_KEY), false, "legacy queue data leaves user-editable App State");
+    assert.equal(after.revision, before.revision + 1, "App State revision observes the internal migration");
+    await shared.change({ operation: "create", path: `/${TICKETS_STATE_KEY}`, value: "unrelated user data" });
+    assert.equal((await tickets.get(id))?.id, id, "an unrelated value under the old key does not shadow dedicated ticket state");
+    assert.equal((await shared.snapshot()).value[TICKETS_STATE_KEY], "unrelated user data", "unrelated App State remains untouched");
+    const userValue = { version: 1, tickets: { [id]: { userOwned: true } }, processedHours: [] };
+    await shared.change({ operation: "update", path: `/${TICKETS_STATE_KEY}`, value: userValue as never });
+    assert.equal((await tickets.get(id))?.id, id, "a user value matching the legacy shape cannot shadow the dedicated queue");
+    assert.deepEqual((await shared.snapshot()).value[TICKETS_STATE_KEY], userValue, "lookalike user data is never overwritten");
+  } finally {
+    await shared.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("ticket claims enforce device affinity and hourly scheduler idempotency", async () => {
@@ -183,7 +240,7 @@ test("root ticket tools plan, list, update, and reject child use", async () => {
   });
   try {
     const extension = createTicketsExtension(
-      { transactAppState: async (change) => change(state as never) },
+      { transactTicketState: async (change) => change(state as never) },
       { device: "command-center", childExtensionNames: [], memory, process, now: () => now, plan: async () => plan },
     );
     const tools = new Map(extension.tools?.map((tool) => [tool.name, tool]));
@@ -247,6 +304,79 @@ test("repo validation refuses non-git, no-origin, and work-path repositories", a
   }
 });
 
+test("incomplete interrupted checkout is never reported ready; ready worker edits survive reuse", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-smudge-"));
+  const repo = join(root, "repo");
+  const origin = join(root, "origin.git");
+  const marker = join(root, "filter-started");
+  const filter = join(root, "slow-smudge.sh");
+  const id = "20261015-1030-smudge";
+  const worktree = join(root, "repo-tickets", id);
+  try {
+    await mkdir(repo);
+    execFileSync("git", ["init", "--bare", "--initial-branch=main", origin]);
+    execFileSync("git", ["init", "--initial-branch=main", repo]);
+    execFileSync("git", ["config", "user.name", "Ticket Test"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "ticket-test@example.invalid"], { cwd: repo });
+    await writeFile(filter, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nsleep 30\ncat\n`);
+    await import("node:fs/promises").then(({ chmod }) => chmod(filter, 0o755));
+    execFileSync("git", ["config", "filter.slow.clean", "cat"], { cwd: repo });
+    execFileSync("git", ["config", "filter.slow.smudge", `${JSON.stringify(filter)} \"$@\"`], { cwd: repo });
+    await writeFile(join(repo, ".gitattributes"), "seed.txt filter=slow\n");
+    await writeFile(join(repo, "seed.txt"), "fixture contents\n");
+    execFileSync("git", ["add", ".gitattributes", "seed.txt"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: repo });
+    execFileSync("git", ["remote", "add", "origin", origin], { cwd: repo });
+    execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repo });
+    execFileSync("git", ["remote", "set-head", "origin", "main"], { cwd: repo });
+
+    const controller = new AbortController();
+    let persistedPreparation: { worktree: string; branch: string; base: string; baseCommit: string } | undefined;
+    const preparing = prepareTicketWorktree(ticket({ id, repo }), boundedRunner, controller.signal, async (state) => {
+      persistedPreparation = state;
+    });
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(marker), "smudge filter started during worktree checkout");
+    assert.equal(persistedPreparation?.worktree, await realpath(worktree), "the unready marker is persisted before checkout starts");
+    controller.abort();
+    await assert.rejects(preparing, /abort|cancel/i);
+
+    const incompleteStatus = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: worktree, encoding: "utf8" });
+    assert.match(incompleteStatus, /seed\.txt/, "interrupted checkout remains visible in the index/status");
+    assert.equal(existsSync(join(worktree, "seed.txt")), false, "fixture content was not fully checked out");
+    await assert.rejects(
+      prepareTicketWorktree({
+        ...ticket({ id, repo }),
+        worktree,
+        branch: `ticket/${id}`,
+        worktreeReady: false,
+        worktreeBaseCommit: persistedPreparation?.baseCommit,
+      }),
+      /incomplete|not ready/i,
+      "an unready registered worktree must not be reused as ready",
+    );
+    assert.equal(execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: worktree, encoding: "utf8" }), incompleteStatus,
+      "the failed readiness check must not reset or alter the interrupted index");
+
+    // A worktree already marked ready may contain legitimate worker changes; reuse must preserve them.
+    execFileSync("git", ["config", "filter.slow.smudge", "cat"], { cwd: repo });
+    const ready = await prepareTicketWorktree(ticket({ id: `${id}-ready`, repo }));
+    await writeFile(join(ready.worktree, "README.md"), "legitimate worker edit\n");
+    const reused = await prepareTicketWorktree({
+      ...ticket({ id: `${id}-ready`, repo }),
+      worktree: ready.worktree,
+      branch: ready.branch,
+      worktreeReady: true,
+      worktreeBaseCommit: ready.baseCommit,
+    });
+    assert.equal(reused.worktree, ready.worktree);
+    assert.equal(await (await import("node:fs/promises")).readFile(join(ready.worktree, "README.md"), "utf8"), "legitimate worker edit\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("ticket worktree starts from origin default and reuses the same branch after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "dpi-ticket-worktree-"));
   const repo = join(root, "repo");
@@ -274,6 +404,56 @@ test("ticket worktree starts from origin default and reuses the same branch afte
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("ticket worktree path rejects symlinked and registered paths into excluded work directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-path-policy-"));
+  const repo = join(root, "repo");
+  const origin = join(root, "origin.git");
+  const office = join(root, "office");
+  const ticketId = "20261015-1030-path-policy";
+  try {
+    await mkdir(repo);
+    await mkdir(office);
+    execFileSync("git", ["init", "--bare", "--initial-branch=main", origin]);
+    execFileSync("git", ["init", "--initial-branch=main", repo]);
+    execFileSync("git", ["config", "user.name", "Ticket Test"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "ticket-test@example.invalid"], { cwd: repo });
+    await writeFile(join(repo, "README.md"), "fixture\n");
+    execFileSync("git", ["add", "README.md"], { cwd: repo });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: repo });
+    execFileSync("git", ["remote", "add", "origin", origin], { cwd: repo });
+    execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repo });
+    execFileSync("git", ["remote", "set-head", "origin", "main"], { cwd: repo });
+    await import("node:fs/promises").then(({ symlink }) => symlink(office, join(root, "repo-tickets")));
+
+    await assert.rejects(prepareTicketWorktree(ticket({ repo, id: ticketId })), /work repos are excluded/i,
+      "a generated worktree parent resolving into office must be refused before creation");
+    const listedAfterReject = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
+    assert.doesNotMatch(listedAfterReject, new RegExp(ticketId));
+
+    const registeredPath = join(office, ticketId);
+    execFileSync("git", ["worktree", "add", "-b", `ticket/${ticketId}`, registeredPath, "origin/main"], { cwd: repo });
+    await assert.rejects(prepareTicketWorktree({ ...ticket({ repo, id: ticketId }), worktree: registeredPath, branch: `ticket/${ticketId}`, worktreeReady: true }),
+      /work repos are excluded/i,
+      "an already-registered worktree under office must be refused before reuse");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reminder message is visible in the normalized transcript and Markdown", () => {
+  const message = "Remember the fixture";
+  const items = toTranscript([{
+    id: 71,
+    conversationId: 1,
+    kind: "dpi.reminder",
+    data: { id: "71", message, text: message, scheduledAt: now, firedAt: now },
+  }]);
+  assert.equal(items[0]?.kind, "event");
+  if (items[0]?.kind !== "event") throw new Error("reminder event was not normalized");
+  assert.equal(items[0].text, message);
+  assert.match(toMarkdown(items), /Remember the fixture/);
 });
 
 test("PR creation reuses an existing branch PR and never invokes merge", async () => {
