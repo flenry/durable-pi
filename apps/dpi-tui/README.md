@@ -22,6 +22,8 @@ Device ids come from `~/.dpi/network.sqlite`, seeded from the repo's `dpi-networ
 | Alt+Enter | queue as a follow-up |
 | Esc | interrupt foreground work (background jobs continue) |
 | Shift+Tab | cycle thinking level |
+| Ctrl+P | cycle to next available model (applies next turn) |
+| Ctrl+Shift+P | cycle to previous available model (applies next turn; requires a terminal reporting modified keys) |
 | Ctrl+L | model picker |
 | Ctrl+O | expand tool output and thinking |
 | Ctrl+C | close an open picker or panel, else clear the input; on an empty input, exit and print the reattach command (session and agent by name when unique, else ids) |

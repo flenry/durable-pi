@@ -178,6 +178,21 @@ function chooseModel(app: App, current?: string) {
   });
 }
 
+/** Cycle the device's available models without opening a picker; changes apply next turn. */
+export async function cycleModel(app: App, direction: 1 | -1) {
+  const handle = app.handle;
+  const models = app.info.models;
+  if (!handle || !models.length) return;
+  const current = app.model.state.agent.model;
+  const index = models.findIndex((m) => m.provider === current?.provider && m.id === current?.modelId);
+  const next = index < 0 ? (direction === 1 ? 0 : models.length - 1) : (index + direction + models.length) % models.length;
+  const model = models[next];
+  await app.run(async () => {
+    await handle.configure({ model: { provider: model.provider, modelId: model.id } });
+    app.flash(`Model: ${model.name} (next turn)`);
+  });
+}
+
 export async function pickModel(app: App) {
   if (!app.handle) return;
   const model = await chooseModel(app, app.model.state.agent.model?.modelId);

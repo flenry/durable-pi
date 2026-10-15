@@ -32,6 +32,8 @@ const KEYS: [string, string][] = [
   ["alt+enter", "queue as a follow-up"],
   ["esc", "interrupt foreground work"],
   ["shift+tab", "cycle thinking level"],
+  ["ctrl+p", "cycle to next model"],
+  ["ctrl+shift+p", "cycle to previous model"],
   ["ctrl+l", "model picker"],
   ["ctrl+o", "expand tool output and thinking"],
   ["ctrl+c", "clear input, or exit when empty"],

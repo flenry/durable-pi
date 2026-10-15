@@ -4,7 +4,47 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.js";
-import { fileCredentialStore, subscriptionDefault } from "../src/subscription.js";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fileCredentialStore, installSubscription, subscriptionDefault, subscriptionModels } from "../src/subscription.js";
+
+const SCOPE = "anthropic/claude-opus-5-5,anthropic/claude-sonnet-5-5,anthropic/claude-haiku-5-5,openai-codex/gpt-6.1-sol,openai-codex/gpt-6-luna";
+
+function catalog() {
+  const models = createModels();
+  installSubscription(models);
+  // Offline catalog availability: never use real logins or call a model.
+  models.getAvailable = async (provider?: string) => models.getModels(provider);
+  return models;
+}
+
+test("subscription catalog includes official Haiku 5.5 metadata", () => {
+  const models = catalog();
+  const haiku = models.getModel("anthropic", "claude-haiku-5-5");
+  assert.ok(haiku);
+  assert.equal(haiku.contextWindow, 1_000_000);
+  assert.equal(haiku.maxTokens, 128_000);
+  assert.equal(haiku.reasoning, true);
+  assert.equal(haiku.api, "anthropic-messages");
+  assert.deepEqual(haiku.cost.tiers, [{ inputTokensAbove: 100_000, input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 }]);
+  assert.equal(models.getAllModels("anthropic").filter((m) => m.id === haiku.id).length, 1);
+  installSubscription(models);
+  assert.equal(models.getModels("anthropic").filter((m) => m.id === haiku.id).length, 1);
+});
+
+test("subscription scope lists exactly the requested five models in order", async () => {
+  const result = await subscriptionModels(catalog(), { DPI_SCOPED_MODELS: SCOPE });
+  assert.deepEqual(result.map((m) => `${m.provider}/${m.id}`), SCOPE.split(","));
+});
+
+test("scope is optional, rejects unknown ids, and excludes unauthenticated providers", async () => {
+  const models = catalog();
+  assert.ok((await subscriptionModels(models, {})).length > 5);
+  await assert.rejects(subscriptionModels(models, { DPI_SCOPED_MODELS: "anthropic/not-a-model" }), /DPI_SCOPED_MODELS/);
+  await assert.rejects(subscriptionModels(models, { DPI_SCOPED_MODELS: "claude-haiku-5-5" }), /DPI_SCOPED_MODELS/);
+  models.getAvailable = async (provider?: string) => provider === "anthropic" ? [] : models.getModels(provider);
+  const result = await subscriptionModels(models, { DPI_SCOPED_MODELS: SCOPE });
+  assert.deepEqual(result.map((m) => m.id), ["gpt-6.1-sol", "gpt-6-luna"]);
+});
 
 const tmp = () => mkdtempSync(join(tmpdir(), "dpi-sub-"));
 const oauth = (n: number) => ({ type: "oauth" as const, access: `a${n}`, refresh: `r${n}`, expires: n });

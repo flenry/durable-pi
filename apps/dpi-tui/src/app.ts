@@ -26,7 +26,7 @@ import {
 } from "../../dpi-sdk/src/api.ts";
 import type { NetworkRegistry } from "../../dpi-sdk/src/node/registry.ts";
 import { COMMANDS, runCommand } from "./commands.ts";
-import { pickModel, pickSession, Prompt } from "./pickers.ts";
+import { cycleModel, pickModel, pickSession, Prompt } from "./pickers.ts";
 import { Line, spinner, TranscriptView } from "./render.ts";
 import { c, editorTheme } from "./theme.ts";
 
@@ -190,6 +190,8 @@ export class App {
       return { consume: true };
     }
     if (matchesKey(data, "shift+tab")) return void this.cycleThinking(), { consume: true };
+    if (matchesKey(data, "ctrl+p")) return void cycleModel(this, 1), { consume: true };
+    if (matchesKey(data, "ctrl+shift+p")) return void cycleModel(this, -1), { consume: true };
     if (matchesKey(data, "ctrl+l")) return void pickModel(this), { consume: true };
     if (matchesKey(data, "ctrl+o")) {
       this.view.expand = !this.view.expand;
