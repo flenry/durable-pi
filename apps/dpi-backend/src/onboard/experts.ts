@@ -87,6 +87,7 @@ interface ExpertExtensionOptions {
   childExtensions: readonly Extension[];
   gitTimeoutMs?: number;
   maxGitOutputBytes?: number;
+  nameConversation?: (conversationId: number, name: string) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -382,6 +383,7 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
           throw new Error("this delegate tool call already owns a child for a different expert");
         if (Boolean(existing.identity.worktree) !== (args.worktree === true))
           throw new Error("this delegate tool call already owns a child with a different worktree setting");
+        options.nameConversation?.(existing.id as number, existing.identity.expert);
         return submitToChild(
           api,
           existing.id,
@@ -434,6 +436,7 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
         throw new Error("this delegate tool call already owns a child for a different expert");
       if (Boolean(created.identity.worktree) !== (args.worktree === true))
         throw new Error("this delegate tool call already owns a child with a different worktree setting");
+      options.nameConversation?.(created.id as number, created.identity.expert);
       return submitToChild(
         api,
         created.id,

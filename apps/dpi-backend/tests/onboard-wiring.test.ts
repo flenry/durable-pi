@@ -9,9 +9,9 @@ import { ROOT_CONVERSATION_ID, type TaskId } from "@earendil-works/pi-durable";
 import { onboardEnabledFromEnv, onboardOptionsFromEnv } from "../src/onboard/config.js";
 import { createPlaybookExtension } from "../src/onboard/playbook.js";
 import { Store } from "../src/store.js";
-import { faux, tempStore } from "./helpers.js";
+import { faux, tempStore, until } from "./helpers.js";
 
-const ONBOARD_ENV_KEYS = ["DPI_ONBOARD", "PI_SETUP_DIR", "DPI_MEMORY", "DPI_MEMORY_HOST", "DPI_SKILLS_EXCLUDE", "DPI_MAX_CHILDREN"] as const;
+const ONBOARD_ENV_KEYS = ["DPI_ONBOARD", "PI_SETUP_DIR", "DPI_MEMORY", "DPI_MEMORY_HOST", "DPI_SKILLS_EXCLUDE", "DPI_MAX_CHILDREN", "DPI_TICKETS"] as const;
 
 type OnboardEnv = Partial<Record<(typeof ONBOARD_ENV_KEYS)[number], string | undefined>>;
 
@@ -62,6 +62,9 @@ test("DPI_ONBOARD defaults off, accepts only explicit values, and validates conf
   assert.throws(() => onboardEnabledFromEnv({ DPI_ONBOARD: "true" }), /DPI_ONBOARD must be 0 or 1/);
   assert.equal(onboardOptionsFromEnv({}).maxChildren, 2);
   assert.equal(onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "4" }).maxChildren, 4);
+  assert.equal(onboardOptionsFromEnv({}).ticketScheduler, false);
+  assert.equal(onboardOptionsFromEnv({ DPI_TICKETS: "1" }).ticketScheduler, true);
+  assert.throws(() => onboardOptionsFromEnv({ DPI_TICKETS: "true" }), /DPI_TICKETS must be 0 or 1/);
   assert.throws(() => onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "0" }), /DPI_MAX_CHILDREN/);
   assert.throws(() => onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "1.5" }), /DPI_MAX_CHILDREN/);
   assert.throws(() => onboardOptionsFromEnv({ DPI_MEMORY: "ssh" }), /DPI_MEMORY_HOST/);
@@ -116,9 +119,9 @@ test("opt-in installs onboarding for new roots, filters memory mutations read-on
         const session = await store!.create({ name: "Onboard root", cwd: t.work, model: faux });
         const { row, h, c } = await store!.resolveAgent(session.id, "main");
         const initial = await store!.agentDetail(row, c);
-        for (const extension of ["skills", "memory", "web", "playbook", "experts"]) assert.ok(initial.extensions.includes(extension), extension);
+        for (const extension of ["skills", "memory", "web", "playbook", "experts", "tickets", "remind"]) assert.ok(initial.extensions.includes(extension), extension);
         const offered = new Set(initial.tools.filter((tool) => tool.offered).map((tool) => tool.name));
-        for (const tool of ["load_skill", "memory_note", "memory_rewrite", "memory_read", "fetch_url", "web_search", "delegate"])
+        for (const tool of ["load_skill", "memory_note", "memory_rewrite", "memory_read", "fetch_url", "web_search", "delegate", "add_ticket", "list_tickets", "run_ticket", "update_ticket", "remind", "list_reminders", "cancel_reminder"])
           assert.ok(offered.has(tool), tool);
 
         const submission = await store!.send(c, { content: "hello", requestId: "onboard-root-prompt" });
@@ -156,6 +159,30 @@ test("opt-in installs onboarding for new roots, filters memory mutations read-on
         for (const tool of ["memory_read", "load_skill", "fetch_url", "web_search"]) assert.ok(offeredReadOnly.has(tool), tool);
       },
     );
+  } finally {
+    await store?.close();
+    await t.cleanup();
+  }
+});
+
+test("ticket scheduler is gated and moves to another session when its host is archived", async () => {
+  const t = await tempStore();
+  const setupDir = await setupFixture(t.root);
+  let store: Store | undefined;
+  try {
+    await withOnboardEnv({ DPI_ONBOARD: "1", DPI_TICKETS: "1", PI_SETUP_DIR: setupDir, DPI_MEMORY: "off" }, async () => {
+      store = await t.open();
+      const first = await store!.create({ name: "Scheduler host", cwd: t.work, model: faux });
+      const second = await store!.create({ name: "Next host", cwd: t.work, model: faux });
+      const firstRow = store!.row(first.id);
+      const secondRow = store!.row(second.id);
+      const schedulerCount = async (row: typeof firstRow) =>
+        (await store!.liveTasks(store!.harness(row))).filter((task) => task.kind === "dpi.ticket.scheduler").length;
+      await until(async () => (await schedulerCount(firstRow)) === 1, 10_000, "initial ticket scheduler");
+      assert.equal(await schedulerCount(secondRow), 0);
+      await store!.archive(firstRow);
+      await until(async () => (await schedulerCount(secondRow)) === 1, 10_000, "scheduler migration after archive");
+    });
   } finally {
     await store?.close();
     await t.cleanup();

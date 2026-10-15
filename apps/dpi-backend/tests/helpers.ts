@@ -5,7 +5,7 @@ import { Store } from "../src/store.js";
 
 // Tests must not inherit a live backend's onboarding settings (e.g. when an agent runs them inside the
 // backend process); suites that need onboarding set these explicitly.
-for (const key of ["DPI_ONBOARD", "DPI_MEMORY", "DPI_MEMORY_HOST", "PI_SETUP_DIR", "DPI_SKILLS_EXCLUDE", "DPI_MAX_CHILDREN"]) delete process.env[key];
+for (const key of ["DPI_ONBOARD", "DPI_MEMORY", "DPI_MEMORY_HOST", "PI_SETUP_DIR", "DPI_SKILLS_EXCLUDE", "DPI_MAX_CHILDREN", "DPI_TICKETS"]) delete process.env[key];
 
 export const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export async function until(fn: () => Promise<boolean>, timeout = 15000, what = "condition") {

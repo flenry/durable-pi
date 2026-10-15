@@ -74,6 +74,7 @@ import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
 import { onboardEnabledFromEnv, onboardOptionsFromEnv, type OnboardOptions } from "./onboard/config.js";
 import { installOnboard } from "./onboard/index.js";
 import { ExpertIdentity } from "./onboard/experts.js";
+import { TICKET_RUN_TASK_NAME, TICKET_SCHEDULER_TASK_NAME } from "./onboard/tickets.js";
 
 export const DURABLE_VERSION = "1.0.3";
 
@@ -90,6 +91,11 @@ export const WRITE_TOOLS = new Set([
   "memory_note",
   "memory_rewrite",
   "delegate",
+  "add_ticket",
+  "run_ticket",
+  "update_ticket",
+  "remind",
+  "cancel_reminder",
 ]);
 
 // Writer tools available before onboarding introduced memory mutations. Used only to recognize the legacy
@@ -209,7 +215,7 @@ export function lockFile(path: string) {
   };
 }
 
-type Opened = { harness: Harness; unlock: () => void; unsubscribe: () => void; jobs: Jobs; addons: Addons };
+type Opened = { harness: Harness; unlock: () => void; unsubscribe: () => void; jobs: Jobs; addons: Addons; ticketScheduler?: unknown };
 type Resolved = { row: SessionRow; h: Harness; c: Conversation };
 
 const encodeCursor = (cursor: unknown) =>
@@ -311,6 +317,7 @@ export class Store {
       }
       if (!(await store.shared.initialized()))
         await store.shared.initialize({ goal: "Explore durable agents", counter: 0, notes: [] });
+      await store.ensureTicketScheduler();
       store.modelList = await store.loadModels();
       for (const { harness } of store.opened.values()) harness.resume();
       return store;
@@ -529,6 +536,7 @@ export class Store {
       throw e;
     }
     this.notify();
+    await this.ensureTicketScheduler();
     return this.sessionSummary(row);
   }
 
@@ -587,6 +595,7 @@ export class Store {
     this.catalog.prepare("DELETE FROM sessions WHERE id=?").run(row.id);
     this.errors.delete(row.id);
     this.notify();
+    await this.ensureTicketScheduler();
     return { archived: target };
   }
 
@@ -612,8 +621,17 @@ export class Store {
       const addons = createAddons({ offline: this.options.provider === "faux" });
       for (const extension of addons.list) registry.install(extension);
       const onboardExtensions = this.onboardOptions
-        ? installOnboard(registry, this.onboardOptions, { childBaseExtensions: [CodingTools] })
+        ? installOnboard(registry, this.onboardOptions, {
+            childBaseExtensions: [CodingTools],
+            shared: this.shared,
+            device: this.name,
+            nameConversation: (conversationId, name) => this.setAgentName(row, conversationId, name),
+            abortTask: (taskId) => this.abortTask(this.harness(row), taskId),
+          })
         : [];
+      const ticketScheduler = onboardExtensions
+        .find((extension) => extension.name === "tickets")
+        ?.tasks?.find((task) => task.definition.name === TICKET_SCHEDULER_TASK_NAME);
       const harness = await Harness.open(
         await openNodeSqliteStorage(row.dbPath),
         {
@@ -667,7 +685,7 @@ export class Store {
       row.model = rootModel.modelId;
       this.catalog.prepare("UPDATE sessions SET provider=?,model=? WHERE id=?").run(row.provider, row.model, row.id);
       const unsubscribe = harness.subscribeCommits(() => this.notify());
-      this.opened.set(row.id, { harness, unlock, unsubscribe, jobs, addons });
+      this.opened.set(row.id, { harness, unlock, unsubscribe, jobs, addons, ticketScheduler });
       this.errors.delete(row.id);
       if (create) harness.resume();
       return harness;
@@ -675,6 +693,43 @@ export class Store {
       unlock();
       throw e;
     }
+  }
+
+  private async ensureTicketScheduler() {
+    if (!this.onboardOptions?.ticketScheduler) return;
+    const rows = this.list();
+    for (const row of rows) {
+      const opened = this.opened.get(row.id);
+      if (!opened) continue;
+      const root = await opened.harness.root(ctx);
+      const active = await root.commit(async (tx) => {
+        let page = await tx.scanTasks({ conversationId: root.id }, 500);
+        const tasks = [...page.items];
+        while (page.next) {
+          page = await tx.scanTasks({ conversationId: root.id }, 500, page.next);
+          tasks.push(...page.items);
+        }
+        return tasks.some((task) => task.kind === TICKET_SCHEDULER_TASK_NAME && task.state.status !== "terminal");
+      }, ctx);
+      if (active) return;
+    }
+    const host = rows.find((row) => this.opened.get(row.id)?.ticketScheduler);
+    const opened = host ? this.opened.get(host.id) : undefined;
+    if (!opened?.ticketScheduler) return;
+    const root = await opened.harness.root(ctx);
+    await root.commit(async (tx) => {
+      let page = await tx.scanTasks({ conversationId: root.id }, 500);
+      const tasks = [...page.items];
+      while (page.next) {
+        page = await tx.scanTasks({ conversationId: root.id }, 500, page.next);
+        tasks.push(...page.items);
+      }
+      if (tasks.some((task) => task.kind === TICKET_SCHEDULER_TASK_NAME && task.state.status !== "terminal")) return;
+      await tx.createTask(opened.ticketScheduler as never, { device: this.name }, {
+        ownership: { kind: "conversation" },
+        background: true,
+      });
+    }, ctx);
   }
 
   async scanAll(h: Harness): Promise<ConversationRecord[]> {
@@ -1226,6 +1281,17 @@ export class Store {
   }
 
   private async taskLabel(h: Harness, node: TaskNode): Promise<{ label?: string; callId?: string } | undefined> {
+    if (node.kind === TICKET_RUN_TASK_NAME) {
+      const task = await h.getTask(node.id as TaskId, ctx);
+      const input = task?.input as { ticketId?: string } | undefined;
+      return input?.ticketId ? { label: `ticket ${input.ticketId}` } : { label: "ticket" };
+    }
+    if (node.kind === TICKET_SCHEDULER_TASK_NAME) return { label: "ticket scheduler" };
+    if (node.kind === "dpi.reminder") {
+      const task = await h.getTask(node.id as TaskId, ctx);
+      const input = task?.input as { id?: string } | undefined;
+      return { label: input?.id ? `reminder ${input.id}` : "reminder" };
+    }
     if (node.kind.startsWith("demo.job.")) {
       const run = (await h.snapshot(JobRuns, node.conversationId as ConversationId, ctx))?.items[String(node.id)];
       const def = jobDef(node.kind.slice("demo.job.".length));

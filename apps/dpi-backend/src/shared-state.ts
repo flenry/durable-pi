@@ -59,6 +59,19 @@ export class SharedState {
       return { value: JSON.parse(JSON.stringify(data)) as AppState, revision: meta.revision };
     }, ctx);
   }
+  /** Run a synchronous mutation against the one device-wide App State document. */
+  async transactAppState<T>(change: (state: AppState) => T): Promise<T> {
+    return this.harness.commit(async (tx) => {
+      const data = await tx.doc(Data);
+      const before = JSON.stringify(data);
+      const result = change(data);
+      const encoded = JSON.stringify(data);
+      if (encoded.length > 100_000) throw Error("App State must be under 100,000 characters");
+      if (encoded !== before) (await tx.doc(Meta)).revision++;
+      if (result === undefined) return result as T;
+      return JSON.parse(JSON.stringify(result)) as T;
+    }, ctx);
+  }
   async change(change: StateChange, receiptKey?: string, expectedRevision?: number) {
     return this.harness.commit(async (tx) => {
       const receipt = receiptKey ? await tx.doc(Receipts, receiptKey, null) : undefined;

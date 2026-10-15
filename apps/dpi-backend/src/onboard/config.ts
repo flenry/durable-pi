@@ -6,6 +6,7 @@
 //   DPI_MEMORY_HOST     ssh alias of the memory host when DPI_MEMORY=ssh (e.g. memory-host)
 //   DPI_SKILLS_EXCLUDE  comma list of skills not offered to durable agents
 //   DPI_MAX_CHILDREN    live delegate children allowed per session (default 2)
+//   DPI_TICKETS         1 enables the durable hourly ticket scheduler (default 0)
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +23,7 @@ export interface OnboardOptions {
   memoryHost: string;
   skillsExclude: string[];
   maxChildren: number;
+  ticketScheduler?: boolean;
 }
 
 /** Skills that drive pi-only machinery (Herdr, worktree workers, pi's own handoff). */
@@ -37,6 +39,8 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
   const maxChildren = Number(maxChildrenText);
   if (!/^[1-9]\d*$/.test(maxChildrenText) || !Number.isSafeInteger(maxChildren))
     throw Error(`DPI_MAX_CHILDREN must be a positive safe integer; got ${maxChildrenText}`);
+  const ticketFlag = env.DPI_TICKETS ?? "0";
+  if (ticketFlag !== "0" && ticketFlag !== "1") throw Error(`DPI_TICKETS must be 0 or 1; got ${ticketFlag}`);
   const setupDir = env.PI_SETUP_DIR ?? "~/.pi";
   if (!setupDir.trim()) throw Error("PI_SETUP_DIR must not be empty");
   const expand = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -49,5 +53,6 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
       .map((s) => s.trim())
       .filter(Boolean),
     maxChildren,
+    ticketScheduler: ticketFlag === "1",
   };
 }

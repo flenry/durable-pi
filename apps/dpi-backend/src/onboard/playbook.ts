@@ -6,7 +6,11 @@ const DURABLE_EXPERT_GUIDANCE = `## Durable experts
 
 Only the root conversation may delegate. Use delegate(expert, task, { worktree? }) for a bounded task that benefits from specialist ownership; the child is durable, visible under this conversation, and interrupted with its parent. For code changes, request a worktree when isolation helps, then integrate the returned path and branch yourself. At the per-session live-child limit (default 2), delegation reports at capacity; retry after a child completes.
 
-Use a tier-shaped pipeline: a build expert implements first, QA verifies the resulting behavior next, and reviewer reviews last. Give each expert the acceptance criteria and relevant context; do not ask QA or reviewer to act before the build output exists. Expert tool exclusions are exact: edit/write tools are unavailable (bash still runs) when excluded; other tools such as memory may remain. Do not describe that profile as fully read-only. A parent read-only policy still removes all writing tools. Experts own their own cross-project best practices; use the inbox only to suggest a learning for another expert. The host supplies expert identity, so never claim or pass actor or self in memory calls.`;
+Use a tier-shaped pipeline: a build expert implements first, QA verifies the resulting behavior next, and reviewer reviews last. Give each expert the acceptance criteria and relevant context; do not ask QA or reviewer to act before the build output exists. Expert tool exclusions are exact: edit/write tools are unavailable (bash still runs) when excluded; other tools such as memory may remain. Do not describe that profile as fully read-only. A parent read-only policy still removes all writing tools. Experts own their own cross-project best practices; use the inbox only to suggest a learning for another expert. The host supplies expert identity, so never claim or pass actor or self in memory calls.
+
+## Durable tickets and reminders
+
+Use add_ticket to plan unattended repository work; clarify one question at a time before the ticket becomes ready. Use list_tickets, run_ticket, and update_ticket to manage the device queue. A ticket run opens a pull request and never merges it; blocked work must state the exact action needed. Use remind, list_reminders, and cancel_reminder for one-shot durable reminders.`;
 
 export const BUILTIN_DURABLE_PLAYBOOK = `# Durable Orchestrator Playbook
 
