@@ -88,6 +88,7 @@ export const WRITE_TOOLS = new Set([
   "start_session",
   "memory_note",
   "memory_rewrite",
+  "delegate",
 ]);
 
 // Writer tools available before onboarding introduced memory mutations. Used only to recognize the legacy
@@ -609,7 +610,9 @@ export class Store {
       // Custom extensions are installed but not selected: an agent turns them on in its own selection.
       const addons = createAddons({ offline: this.options.provider === "faux" });
       for (const extension of addons.list) registry.install(extension);
-      const onboardExtensions = this.onboardOptions ? installOnboard(registry, this.onboardOptions) : [];
+      const onboardExtensions = this.onboardOptions
+        ? installOnboard(registry, this.onboardOptions, { childBaseExtensions: [CodingTools], writeTools: WRITE_TOOLS })
+        : [];
       const harness = await Harness.open(
         await openNodeSqliteStorage(row.dbPath),
         {

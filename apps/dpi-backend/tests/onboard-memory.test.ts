@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { MemoryError, createMemoryClient, memoryCommand, type MemoryClient } from "../src/onboard/memory-client.js";
 import { normalizeRemote, projectKeyFor } from "../src/onboard/project-key.js";
@@ -35,6 +36,7 @@ const localOptions = (setupDir: string): OnboardOptions => ({
   memory: "local",
   memoryHost: "",
   skillsExclude: [],
+  maxChildren: 2,
 });
 
 const sshOptions = (memoryHost = "memory-host"): OnboardOptions => ({
@@ -42,6 +44,7 @@ const sshOptions = (memoryHost = "memory-host"): OnboardOptions => ({
   memory: "ssh",
   memoryHost,
   skillsExclude: [],
+  maxChildren: 2,
 });
 
 test("normalizeRemote matches the setup key format for SSH and HTTPS URLs", () => {
@@ -228,7 +231,11 @@ test("memory extension exposes current mutation semantics, safe reads, and CLI-b
   assert.equal(tools.get("memory_rewrite")?.replay, "unsafe");
   assert.equal(tools.get("memory_read")?.replay, "safe");
 
-  const api = { agent: async () => ({ cwd: "/work/repo" }) };
+  const api = {
+    conversationId: ROOT_CONVERSATION_ID,
+    agent: async () => ({ cwd: "/work/repo" }),
+    snapshot: async () => undefined,
+  };
   const context = {} as never;
   const note = await tools.get("memory_note")!.execute(
     { scope: "project", topic: "topic", entry: "A durable fact", summary: "A summary" } as never,

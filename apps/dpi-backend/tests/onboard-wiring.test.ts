@@ -11,7 +11,7 @@ import { createPlaybookExtension } from "../src/onboard/playbook.js";
 import { Store } from "../src/store.js";
 import { faux, tempStore } from "./helpers.js";
 
-const ONBOARD_ENV_KEYS = ["DPI_ONBOARD", "PI_SETUP_DIR", "DPI_MEMORY", "DPI_MEMORY_HOST", "DPI_SKILLS_EXCLUDE"] as const;
+const ONBOARD_ENV_KEYS = ["DPI_ONBOARD", "PI_SETUP_DIR", "DPI_MEMORY", "DPI_MEMORY_HOST", "DPI_SKILLS_EXCLUDE", "DPI_MAX_CHILDREN"] as const;
 
 type OnboardEnv = Partial<Record<(typeof ONBOARD_ENV_KEYS)[number], string | undefined>>;
 
@@ -60,6 +60,10 @@ test("DPI_ONBOARD defaults off, accepts only explicit values, and validates conf
   assert.equal(onboardEnabledFromEnv({ DPI_ONBOARD: "0" }), false);
   assert.equal(onboardEnabledFromEnv({ DPI_ONBOARD: "1" }), true);
   assert.throws(() => onboardEnabledFromEnv({ DPI_ONBOARD: "true" }), /DPI_ONBOARD must be 0 or 1/);
+  assert.equal(onboardOptionsFromEnv({}).maxChildren, 2);
+  assert.equal(onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "4" }).maxChildren, 4);
+  assert.throws(() => onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "0" }), /DPI_MAX_CHILDREN/);
+  assert.throws(() => onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "1.5" }), /DPI_MAX_CHILDREN/);
   assert.throws(() => onboardOptionsFromEnv({ DPI_MEMORY: "ssh" }), /DPI_MEMORY_HOST/);
   assert.throws(() => onboardOptionsFromEnv({ DPI_MEMORY: "unexpected" }), /DPI_MEMORY must be/);
   assert.throws(() => onboardOptionsFromEnv({ PI_SETUP_DIR: "" }), /PI_SETUP_DIR must not be empty/);
@@ -82,8 +86,8 @@ test("playbook uses the configured override only for the canonical root and fall
     assert.match(fallback ?? "", /one question at a time/i);
     assert.match(fallback ?? "", /define done/i);
     assert.match(fallback ?? "", /report.*close the loop/i);
-    assert.match(fallback ?? "", /Phase 1 limitations/i);
-    assert.match(fallback ?? "", /does not provide configured durable expert delegation/i);
+    assert.match(fallback ?? "", /delegate\(expert, task/);
+    assert.match(fallback ?? "", /build expert implements first, QA verifies.*reviewer reviews last/i);
     assert.doesNotMatch(fallback ?? "", /Herdr|worker_watch|expert_manage/i);
 
     const child = await render(sectionInput((ROOT_CONVERSATION_ID + 1) as number), BACKGROUND_CONTEXT);
@@ -93,6 +97,7 @@ test("playbook uses the configured override only for the canonical root and fall
     await writeFile(join(root, "experts", "ORCHESTRATOR.durable.md"), "# Configured Guidance\nCONFIGURED_GUIDANCE_SENTINEL\n");
     const override = await render(sectionInput(ROOT_CONVERSATION_ID), BACKGROUND_CONTEXT);
     assert.match(override ?? "", /CONFIGURED_GUIDANCE_SENTINEL/);
+    assert.match(override ?? "", /delegate\(expert, task/);
     assert.doesNotMatch(override ?? "", /Tier sizing/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -111,9 +116,9 @@ test("opt-in installs onboarding for new roots, filters memory mutations read-on
         const session = await store!.create({ name: "Onboard root", cwd: t.work, model: faux });
         const { row, h, c } = await store!.resolveAgent(session.id, "main");
         const initial = await store!.agentDetail(row, c);
-        for (const extension of ["skills", "memory", "web", "playbook"]) assert.ok(initial.extensions.includes(extension), extension);
+        for (const extension of ["skills", "memory", "web", "playbook", "experts"]) assert.ok(initial.extensions.includes(extension), extension);
         const offered = new Set(initial.tools.filter((tool) => tool.offered).map((tool) => tool.name));
-        for (const tool of ["load_skill", "memory_note", "memory_rewrite", "memory_read", "fetch_url", "web_search"])
+        for (const tool of ["load_skill", "memory_note", "memory_rewrite", "memory_read", "fetch_url", "web_search", "delegate"])
           assert.ok(offered.has(tool), tool);
 
         const submission = await store!.send(c, { content: "hello", requestId: "onboard-root-prompt" });
@@ -147,6 +152,7 @@ test("opt-in installs onboarding for new roots, filters memory mutations read-on
         const offeredReadOnly = new Set(readOnly.tools.filter((tool) => tool.offered).map((tool) => tool.name));
         assert.equal(offeredReadOnly.has("memory_note"), false);
         assert.equal(offeredReadOnly.has("memory_rewrite"), false);
+        assert.equal(offeredReadOnly.has("delegate"), false);
         for (const tool of ["memory_read", "load_skill", "fetch_url", "web_search"]) assert.ok(offeredReadOnly.has(tool), tool);
       },
     );
@@ -256,6 +262,7 @@ test("read-only policy survives onboarding upgrades and explicit disable restore
         assert.equal(disabled.config.readOnly, false);
         assert.ok(disabled.tools.find((tool) => tool.name === "memory_note")?.offered);
         assert.ok(disabled.tools.find((tool) => tool.name === "memory_rewrite")?.offered);
+        assert.ok(disabled.tools.find((tool) => tool.name === "delegate")?.offered);
       },
     );
 
@@ -369,7 +376,7 @@ test("missing setup degrades gracefully without creating a local memory tree", a
       assert.equal((await store!.settled(h, submission.id as number, 20000)).status, "done");
       const prompt = systemText(await store!.activeEntries(c));
       assert.match(prompt, /No skills found/);
-      assert.match(prompt, /Phase 1 limitations/);
+      assert.match(prompt, /delegate\(expert, task/);
       assert.match(prompt, /memory index unavailable/);
       assert.ok((await store!.agentDetail(row, c)).tools.some((tool) => tool.name === "fetch_url" && tool.offered));
       assert.equal(existsSync(missingSetup), false, "setup/memory clients do not create a local setup tree");

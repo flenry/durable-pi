@@ -99,7 +99,7 @@ function localClient(setupDir: string, env: NodeJS.ProcessEnv): MemoryClient {
     assert.equal(args[0], join(setupDir, "bin", "pi-memory.ts"));
     return spawn(command, [...args], { ...options, env, cwd: tmpdir() });
   }) as typeof spawn;
-  const options: OnboardOptions = { setupDir, memory: "local", memoryHost: "", skillsExclude: [] };
+  const options: OnboardOptions = { setupDir, memory: "local", memoryHost: "", skillsExclude: [], maxChildren: 2 };
   return createMemoryClient(options, { spawn: spawnWithFixtureEnv });
 }
 
@@ -304,7 +304,11 @@ test("load_skill resolves its reference and memory tools round-trip through the 
     const client = localClient(setupDir, safeEnvironment({ PI_PROJECTS_DIR: projectsDir, PI_EXPERTS_DIR: expertsDir }));
     const memory = createMemoryExtension(client);
     const tools = toolMap(memory);
-    const api = { agent: async () => ({ cwd: repoDir }) };
+    const api = {
+      conversationId: ROOT_CONVERSATION_ID,
+      agent: async () => ({ cwd: repoDir }),
+      snapshot: async () => undefined,
+    };
     const note = await tools.get("memory_note")!.execute(
       { scope: "project", topic: "qa", entry: "Tool execution writes through pi-memory", summary: "Actual CLI tools" } as never,
       api as never,
@@ -389,6 +393,7 @@ test("SSH memory proxy writes only to its simulated VM and never falls back loca
       memory: "ssh",
       memoryHost: "test-memory-host",
       skillsExclude: [],
+      maxChildren: 2,
     };
     const client = createMemoryClient(sshOptions, { spawn: sshProxy });
     const projectKey = await initTempRepo(join(root, "repo"), "https://example.invalid/qa/ssh-phase1.git");

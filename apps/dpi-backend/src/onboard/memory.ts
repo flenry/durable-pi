@@ -1,8 +1,9 @@
 // Durable memory tools and per-request project-memory context. Project paths are reduced to a
 // stable key on this device; only that key crosses MemoryClient to pi-setup.
 import { Type } from "@earendil-works/pi-ai";
-import { defineExtension, defineTool, section } from "@earendil-works/pi-durable";
+import { ROOT_CONVERSATION_ID, defineExtension, defineTool, section, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
+import { ExpertIdentity } from "./experts.js";
 import { projectKeyFor } from "./project-key.js";
 import type { MemoryClient } from "./memory-client.js";
 
@@ -11,8 +12,14 @@ type RewriteResult = NoteResult & { deleted: boolean };
 type InboxResult = { inbox: { id: string } };
 type ReadResult = { text: string };
 
-// Phase 1 root agents only; expert identity enforcement remains a Phase 2 prerequisite.
-const actor = "orchestrator" as const;
+type MemoryIdentity = { actor: "orchestrator" } | { actor: "expert"; self: string };
+
+async function memoryIdentity(api: ToolExecutionApi, ctx: Context): Promise<MemoryIdentity> {
+  if (api.conversationId === ROOT_CONVERSATION_ID) return { actor: "orchestrator" };
+  const identity = await api.snapshot(ExpertIdentity, api.conversationId, ctx);
+  if (typeof identity?.expert === "string" && identity.expert) return { actor: "expert", self: identity.expert };
+  throw new Error("Memory writes require the root or a trusted expert identity.");
+}
 
 function response(text: string) {
   return { content: [{ type: "text" as const, text }] };
@@ -23,10 +30,11 @@ function currentProjectKey(cwd: string | undefined, keyFor: (cwd: string) => str
   return keyFor(cwd);
 }
 
-function targetExpert(scope: string, expert: string | undefined): string | undefined {
-  if (scope === "project") return expert;
-  if (!expert?.trim()) throw new Error(`scope "${scope}" needs an expert name`);
-  return expert;
+function targetExpert(scope: string, expert: string | undefined, self?: string): string | undefined {
+  if (scope === "project") return undefined;
+  if (expert?.trim()) return expert;
+  if (scope === "expert" && self) return self;
+  throw new Error(`scope "${scope}" needs an expert name`);
 }
 
 export function createMemoryExtension(client: MemoryClient, projectKeyForCwd: (cwd: string) => string = projectKeyFor) {
@@ -47,7 +55,8 @@ export function createMemoryExtension(client: MemoryClient, projectKeyForCwd: (c
     replay: "unsafe",
     execute: async (args, api, ctx) => {
       const projectKey = currentProjectKey((await api.agent(ctx)).cwd, keyFor);
-      const expert = targetExpert(args.scope, args.expert);
+      const identity = await memoryIdentity(api, ctx);
+      const expert = targetExpert(args.scope, args.expert, identity.actor === "expert" ? identity.self : undefined);
       const result = await client.call<NoteResult | InboxResult>("note", {
         scope: args.scope,
         projectKey,
@@ -56,8 +65,7 @@ export function createMemoryExtension(client: MemoryClient, projectKeyForCwd: (c
         entry: args.entry,
         ...(args.summary === undefined ? {} : { summary: args.summary }),
         ...(args.pinned === undefined ? {} : { pinned: args.pinned }),
-        // The CLI accepts this for its legacy policy check. It is self-asserted, not authenticated authorization.
-        actor,
+        ...identity,
       }, ctx);
       if ("inbox" in result) return response(`Added inbox candidate ${result.inbox.id} for ${expert} (project ${projectKey}).`);
       const status = result.created ? "Created" : "Updated";
@@ -83,7 +91,8 @@ export function createMemoryExtension(client: MemoryClient, projectKeyForCwd: (c
     replay: "unsafe",
     execute: async (args, api, ctx) => {
       const projectKey = currentProjectKey((await api.agent(ctx)).cwd, keyFor);
-      const expert = targetExpert(args.scope, args.expert);
+      const identity = await memoryIdentity(api, ctx);
+      const expert = targetExpert(args.scope, args.expert, identity.actor === "expert" ? identity.self : undefined);
       const result = await client.call<RewriteResult>("rewrite", {
         scope: args.scope,
         projectKey,
@@ -91,7 +100,7 @@ export function createMemoryExtension(client: MemoryClient, projectKeyForCwd: (c
         topic: args.topic,
         content: args.content,
         ...(args.summary === undefined ? {} : { summary: args.summary }),
-        actor,
+        ...identity,
       }, ctx);
       return response(
         result.deleted
@@ -137,9 +146,38 @@ export function createMemoryExtension(client: MemoryClient, projectKeyForCwd: (c
     { tag: false },
   );
 
+  const expertMemory = section(
+    "expert-memory",
+    async (input, ctx: Context) => {
+      if (input.conversationId === ROOT_CONVERSATION_ID) return undefined;
+      const identity = await input.read.snapshot(ExpertIdentity, input.conversationId, ctx);
+      if (typeof identity?.expert !== "string" || !identity.expert) return undefined;
+      try {
+        const result = await client.call<{
+          profile?: { skills?: unknown };
+          bestPracticesIndex?: unknown;
+        }>("expert", { name: identity.expert }, ctx);
+        const skills = Array.isArray(result.profile?.skills)
+          ? result.profile.skills.filter((skill): skill is string => typeof skill === "string")
+              .map((skill) => skill.split(/[\\/]/).filter(Boolean).at(-1) ?? "")
+              .filter(Boolean)
+          : [];
+        const index = typeof result.bestPracticesIndex === "string" ? result.bestPracticesIndex.trim() : "";
+        return [
+          `## Your best practices — ${identity.expert}`,
+          index || "_(empty — no best practices recorded yet)_",
+          ...(skills.length ? ["## Skills listed for this expert", skills.map((skill) => `- \`${skill}\``).join("\n"), "Load a listed skill with `load_skill(name)` when relevant."] : []),
+        ].join("\n\n");
+      } catch {
+        return `## Your best practices — ${identity.expert}\n\n_(best-practices index unavailable; memory tools can retry)_`;
+      }
+    },
+    { tag: false },
+  );
+
   return defineExtension({
     name: "memory",
-    sections: [projectMemory],
+    sections: [projectMemory, expertMemory],
     tools: [memoryNote, memoryRewrite, memoryRead],
   });
 }

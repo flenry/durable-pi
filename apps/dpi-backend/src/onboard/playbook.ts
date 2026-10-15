@@ -2,6 +2,12 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineExtension, ROOT_CONVERSATION_ID, section } from "@earendil-works/pi-durable";
 
+const DURABLE_EXPERT_GUIDANCE = `## Durable experts
+
+Only the root conversation may delegate. Use delegate(expert, task, { worktree? }) for a bounded task that benefits from specialist ownership; the child is durable, visible under this conversation, and interrupted with its parent. For code changes, request a worktree when isolation helps, then integrate the returned path and branch yourself. At the per-session live-child limit (default 2), delegation reports at capacity; retry after a child completes.
+
+Use a tier-shaped pipeline: a build expert implements first, QA verifies the resulting behavior next, and reviewer reviews last. Give each expert the acceptance criteria and relevant context; do not ask QA or reviewer to act before the build output exists. Experts own their own cross-project best practices; use the inbox only to suggest a learning for another expert. The host supplies expert identity, so never claim or pass actor or self in memory calls.`;
+
 export const BUILTIN_DURABLE_PLAYBOOK = `# Durable Orchestrator Playbook
 
 You are the root orchestrator. Plan the work, use the available tools, verify the result, and close the loop honestly.
@@ -26,15 +32,13 @@ Work only with the capabilities actually offered in this conversation. Use tests
 
 Report what changed, which acceptance criteria passed, exact checks run, and remaining risks or blockers. If a requested capability is unavailable, say so and offer a safe next step. When project memory is available, record concise project-specific learnings; otherwise say that it was unavailable.
 
-## Phase 1 limitations
-
-This phase can expose skills, project memory, and web lookup tools, subject to device configuration. It does not provide configured durable expert delegation, ticket automation, or deployment. Do not claim those capabilities or imply that work was delegated. Memory tool actor identity is not authenticated in Phase 1; the playbook is guidance, not an authorization boundary.
+${DURABLE_EXPERT_GUIDANCE}
 `;
 
 function playbookText(setupDir: string): string {
   try {
     const configured = readFileSync(join(setupDir, "experts", "ORCHESTRATOR.durable.md"), "utf8").trim();
-    return configured || BUILTIN_DURABLE_PLAYBOOK;
+    return configured ? `${configured}\n\n${DURABLE_EXPERT_GUIDANCE}` : BUILTIN_DURABLE_PLAYBOOK;
   } catch {
     return BUILTIN_DURABLE_PLAYBOOK;
   }

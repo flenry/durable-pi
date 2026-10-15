@@ -5,6 +5,7 @@
 //   DPI_MEMORY          local | ssh | off — where the memory CLI runs (default local)
 //   DPI_MEMORY_HOST     ssh alias of the memory host when DPI_MEMORY=ssh (e.g. memory-host)
 //   DPI_SKILLS_EXCLUDE  comma list of skills not offered to durable agents
+//   DPI_MAX_CHILDREN    live delegate children allowed per session (default 2)
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -20,6 +21,7 @@ export interface OnboardOptions {
   memory: "local" | "ssh" | "off";
   memoryHost: string;
   skillsExclude: string[];
+  maxChildren: number;
 }
 
 /** Skills that drive pi-only machinery (Herdr, worktree workers, pi's own handoff). */
@@ -31,6 +33,10 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
     throw Error(`DPI_MEMORY must be local, ssh, or off; got ${memory}`);
   const memoryHost = env.DPI_MEMORY_HOST ?? "";
   if (memory === "ssh" && !memoryHost) throw Error("DPI_MEMORY=ssh needs DPI_MEMORY_HOST (an ssh alias)");
+  const maxChildrenText = env.DPI_MAX_CHILDREN ?? "2";
+  const maxChildren = Number(maxChildrenText);
+  if (!/^[1-9]\d*$/.test(maxChildrenText) || !Number.isSafeInteger(maxChildren))
+    throw Error(`DPI_MAX_CHILDREN must be a positive safe integer; got ${maxChildrenText}`);
   const setupDir = env.PI_SETUP_DIR ?? "~/.pi";
   if (!setupDir.trim()) throw Error("PI_SETUP_DIR must not be empty");
   const expand = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -42,5 +48,6 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    maxChildren,
   };
 }
