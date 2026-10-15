@@ -122,15 +122,21 @@ function profileOf(value: unknown, expectedName: string): ExpertConfiguration {
   };
 }
 
+/** Expert configs are shared with plain pi, whose top level `max` is durable's `xhigh`. */
+export function durableThinkingLevel(level: string): (typeof THINKING_LEVELS)[number] | undefined {
+  const mapped = level === "max" ? "xhigh" : level;
+  return (THINKING_LEVELS as readonly string[]).includes(mapped) ? (mapped as (typeof THINKING_LEVELS)[number]) : undefined;
+}
+
 function modelRef(config: ExpertConfiguration, name: string) {
   const slash = config.model.model.indexOf("/");
   if (slash < 1 || slash === config.model.model.length - 1)
     throw new Error(`Expert "${name}" has an invalid model id`);
-  if (!(THINKING_LEVELS as readonly string[]).includes(config.model.thinking))
-    throw new Error(`Expert "${name}" has an invalid thinking level`);
+  const thinkingLevel = durableThinkingLevel(config.model.thinking);
+  if (!thinkingLevel) throw new Error(`Expert "${name}" has an invalid thinking level "${config.model.thinking}"`);
   return {
     model: { provider: config.model.model.slice(0, slash), modelId: config.model.model.slice(slash + 1) },
-    thinkingLevel: config.model.thinking as (typeof THINKING_LEVELS)[number],
+    thinkingLevel,
   };
 }
 

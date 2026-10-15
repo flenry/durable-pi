@@ -10,7 +10,7 @@ import { Store } from "../src/store.js";
 import { faux, tempStore, until } from "./helpers.js";
 import type { MemoryClient } from "../src/onboard/memory-client.js";
 import { createMemoryExtension } from "../src/onboard/memory.js";
-import { createExpertsExtension, DelegateChildren, ExpertIdentity } from "../src/onboard/experts.js";
+import { createExpertsExtension, DelegateChildren, durableThinkingLevel, ExpertIdentity } from "../src/onboard/experts.js";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -739,4 +739,11 @@ test("trusted expert section renders the current best-practices index and listed
   assert.match(rendered ?? "", /codebase-design/);
   assert.match(rendered ?? "", /grill/);
   assert.doesNotMatch(rendered ?? "", /fixture\/skills/);
+});
+
+test("plain-pi thinking level max maps to durable xhigh; unknown levels are rejected", () => {
+  assert.equal(durableThinkingLevel("max"), "xhigh");
+  assert.equal(durableThinkingLevel("medium"), "medium");
+  assert.equal(durableThinkingLevel("xhigh"), "xhigh");
+  assert.equal(durableThinkingLevel("ultra"), undefined);
 });
