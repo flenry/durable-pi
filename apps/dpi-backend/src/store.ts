@@ -132,6 +132,17 @@ const ReadOnlyPolicy = defineDoc<ReadOnlyPolicyState>({
   checkpointWhen: () => true,
 });
 
+type GuardSelectionState = { migrationVersion: number; optedOut: boolean };
+const GUARD_SELECTION_MIGRATION_VERSION = 1;
+const GuardSelectionPolicy = defineDoc<GuardSelectionState>({
+  kind: "dpi.store-guard-selection",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ migrationVersion: 0, optedOut: false }),
+});
+
 function saveToolSelection(tools: AgentState["tools"]): SavedToolSelection {
   if (tools === undefined) return { kind: "all" };
   if (Array.isArray(tools)) return { kind: "allow", names: [...tools] };
@@ -247,6 +258,8 @@ export class Store {
   private compactions = new Map<string, Partial<CompactionSettings> | null>();
   /** Task labels never change once known: tool names of pi.tool tasks, job titles of job runs. */
   private taskLabels = new Map<string, { label?: string; callId?: string }>();
+  /** Serializes all Store submission admissions by conversation and requestId before host approval side effects. */
+  private submissionTails = new Map<string, Promise<void>>();
 
   get catalogPath() {
     return join(this.options.dataDir, "catalog.sqlite");
@@ -679,6 +692,7 @@ export class Store {
       // Migrate and apply durable tool policies before recovery can issue any request.
       for (const record of await this.scanAll(harness)) {
         const conversation = (await harness.conversation(record.id, ctx))!;
+        await this.reconcileGuardSelection(harness, conversation);
         await this.reconcileReadOnlyPolicy(harness, conversation, this.onboardOptions !== undefined);
         const previous = (await conversation.agent(ctx)).model;
         const routed = this.routedModel(previous);
@@ -866,6 +880,44 @@ export class Store {
     return { agent, all: [...all.values()], offered: new Set(agent.tools.map((t) => t.name)) };
   }
 
+  /** One-time upgrade of pre-guard explicit selections; later opt-outs are recorded in GuardSelectionPolicy. */
+  private async reconcileGuardSelection(h: Harness, c: Conversation) {
+    if (!this.onboardOptions) return;
+    const current = await h.snapshot(GuardSelectionPolicy, c.id, ctx);
+    if ((current?.migrationVersion ?? 0) >= GUARD_SELECTION_MIGRATION_VERSION) return;
+    await c.commit(async (tx) => {
+      const policy = await tx.doc(GuardSelectionPolicy, c.id);
+      if (policy.migrationVersion >= GUARD_SELECTION_MIGRATION_VERSION) return;
+      const agent = await tx.doc(AgentDoc, c.id);
+      if (Array.isArray(agent.extensions) && !agent.extensions.includes("durable-guards"))
+        agent.extensions = [...agent.extensions, "durable-guards"];
+      policy.migrationVersion = GUARD_SELECTION_MIGRATION_VERSION;
+      policy.optedOut = false;
+    }, ctx);
+  }
+
+  private async recordGuardSelection(c: Conversation, enabled: boolean) {
+    await c.commit(async (tx) => {
+      const policy = await tx.doc(GuardSelectionPolicy, c.id);
+      policy.migrationVersion = GUARD_SELECTION_MIGRATION_VERSION;
+      policy.optedOut = !enabled;
+    }, ctx);
+  }
+
+  private async serializeSubmission<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.submissionTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.submissionTails.set(key, current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.submissionTails.get(key) === current) this.submissionTails.delete(key);
+    }
+  }
+
   private async reconcileReadOnlyPolicy(h: Harness, c: Conversation, migrateLegacy: boolean) {
     const existing = await h.snapshot(ReadOnlyPolicy, c.id, ctx);
     const identity = await h.snapshot(ExpertIdentity, c.id, ctx);
@@ -1005,6 +1057,7 @@ export class Store {
       ? [...agent.extensions, guard]
       : undefined;
     await fork.configure({ model: this.routedModel(agent.model), ...(extensions ? { extensions } : {}) }, ctx);
+    if (guard) await this.recordGuardSelection(fork, true);
     if (typeof body.name === "string" && body.name.trim()) this.setAgentName(row, fork.id as number, body.name);
     this.notify();
     return this.agentSummary(row, fork);
@@ -1044,17 +1097,34 @@ export class Store {
     return (await this.agentDetail(row, c)).config;
   }
 
-  async send(c: Conversation, body: Record<string, unknown>, sessionId?: string) {
+  private inputSubmission(body: Record<string, unknown>) {
     if (typeof body.content !== "string" || !body.content.trim() || body.content.length > 100000)
       throw invalid("content must be a message under 100,000 characters");
     const whenBusy = (body.whenBusy ?? "followUp") as WhenBusy;
     if (!["steer", "followUp", "reject"].includes(whenBusy)) throw invalid("whenBusy must be followUp, steer or reject");
     if (typeof body.requestId !== "string" || !body.requestId || body.requestId.length > 128)
       throw invalid("requestId is required (≤128 chars) so retries never submit twice");
-    const approvalHash = commandApprovalFromUserMessage(body.content);
-    if (approvalHash && sessionId && c.id === ROOT_CONVERSATION_ID)
-      this.opened.get(sessionId)?.guardApprovals?.approve(approvalHash, c.id);
-    return c.submit({ type: "input", content: body.content, requestId: body.requestId, whenBusy }, ctx);
+    return { content: body.content, requestId: body.requestId, whenBusy };
+  }
+
+  /** Internal/model-origin sends have no approval capability. */
+  async send(c: Conversation, body: Record<string, unknown>) {
+    const input = this.inputSubmission(body);
+    return this.serializeSubmission(`${c.id}:${input.requestId}`, () => c.submit({ type: "input", ...input }, ctx));
+  }
+
+  /** The authenticated HTTP user-message route is the only caller allowed to grant a root-chat approval. */
+  async submitAuthenticatedUserMessage(row: SessionRow, c: Conversation, body: Record<string, unknown>) {
+    const input = this.inputSubmission(body);
+    const approvalHash = c.id === ROOT_CONVERSATION_ID ? commandApprovalFromUserMessage(input.content) : undefined;
+    const h = this.harness(row);
+    const key = `${c.id}:${input.requestId}`;
+    return this.serializeSubmission(key, async () => {
+      const existing = await h.commit((tx) => tx.submissionByRequest(c.id, input.requestId), ctx);
+      const submission = await c.submit({ type: "input", ...input }, ctx);
+      if (!existing && approvalHash) this.opened.get(row.id)?.guardApprovals?.approve(approvalHash, c.id);
+      return submission;
+    });
   }
 
   async settled(h: Harness, submissionId: number, waitMs = 0, signal?: AbortSignal): Promise<SendResult> {
@@ -1217,6 +1287,8 @@ export class Store {
       const others = (await c.agent(ctx)).extensions.filter((e) => e.name !== extension.name);
       const next = (enabled ? [...others, extension] : others).sort((a, b) => rank(a.name) - rank(b.name));
       await c.configure({ extensions: next }, ctx);
+      if (body.name === "durable-guards" && this.onboardOptions)
+        await this.recordGuardSelection(c, enabled);
     } else if (typeof body.prompt === "string") {
       const prompt = body.prompt;
       if (!PROMPTS.some((p) => p.id === prompt)) throw invalid(`Unknown prompt ${prompt}. Known: ${PROMPTS.map((p) => p.id).join(", ")}`);

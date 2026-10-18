@@ -138,7 +138,7 @@ export function v1(store: Store) {
     `${a}/messages`,
     route(async (req, res) => {
       const { h, c, row } = L(res);
-      const submission = await store.send(c, req.body ?? {}, row.id);
+      const submission = await store.submitAuthenticatedUserMessage(row, c, req.body ?? {});
       const waitMs = Number(req.body?.waitMs ?? 0) || 0;
       if (!waitMs) return res.status(202).json({ submissionId: submission.id, status: "queued" });
       const closed = new AbortController();

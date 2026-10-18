@@ -37,7 +37,7 @@ export const TEST_RUNNER_GUARD_FIXTURES: readonly {
   { name: "heredoc is untouched", command: "npx vitest <<'EOF'\ntext\nEOF" },
 ];
 
-/** Exact shared destructive-pattern examples; text-only exceptions are separately specified. */
+/** Shared destructive-pattern fixtures checked against durable and plain-pi implementations. */
 export const DESTRUCTIVE_GUARD_FIXTURES: readonly {
   name: string;
   command: string;
@@ -61,10 +61,14 @@ export const DESTRUCTIVE_GUARD_FIXTURES: readonly {
   { name: "filesystem format", command: "mkfs.ext4 /dev/sda", label: "mkfs" },
   { name: "fork bomb", command: ":() { :|:& };:", label: "fork bomb" },
   { name: "git delete branch is warn-only", command: "git branch -D topic" },
-  { name: "echo literal", command: "echo 'rm -rf scratch'" },
-  { name: "printf literal", command: "printf '%s\\n' 'DROP TABLE users'" },
-  { name: "quoted heredoc literal", command: "cat <<'EOF'\nrm -rf scratch\nDROP TABLE users\nEOF" },
-  { name: "unquoted heredoc literal", command: "cat <<EOF\nrm -rf scratch\nEOF" },
+  { name: "echo text matches plain-pi baseline", command: "echo 'rm -rf scratch'", label: "rm -rf" },
+  { name: "printf text matches plain-pi baseline", command: "printf '%s\\n' 'DROP TABLE users'", label: "SQL DROP/TRUNCATE" },
+  { name: "quoted heredoc text matches plain-pi baseline", command: "cat <<'EOF'\nrm -rf scratch\nDROP TABLE users\nEOF", label: "rm -rf" },
+  { name: "unquoted heredoc text matches plain-pi baseline", command: "cat <<EOF\nrm -rf scratch\nEOF", label: "rm -rf" },
+  { name: "quoted executable heredoc", command: "bash <<'EOF'\nrm -rf scratch\nEOF", label: "rm -rf" },
+  { name: "unquoted executable heredoc", command: "bash <<EOF\nrm -rf scratch\nEOF", label: "rm -rf" },
+  { name: "single ampersand list", command: "echo safe & rm -rf scratch", label: "rm -rf" },
+  { name: "process substitution", command: "echo <(rm -rf scratch)", label: "rm -rf" },
   { name: "echo command substitution remains guarded", command: "echo \"$(rm -rf scratch)\"", label: "rm -rf" },
   { name: "unquoted heredoc command substitution remains guarded", command: "cat <<EOF\n$(rm -rf scratch)\nEOF", label: "rm -rf" },
   { name: "dangerous later segment still guarded", command: "echo rm -rf scratch; rm -rf real", label: "rm -rf" },
@@ -247,40 +251,9 @@ function heredocDeclarations(line: string): { delimiter: string; stripTabs: bool
   return result;
 }
 
-/** Remove literal here-doc bodies while retaining unquoted command substitutions that the shell executes. */
-function removeLiteralHeredocBodies(command: string): string {
-  const lines = command.split("\n");
-  const output: string[] = [];
-  const pending: { delimiter: string; stripTabs: boolean; quoted: boolean }[] = [];
-  for (const line of lines) {
-    const heredoc = pending[0];
-    if (heredoc) {
-      const candidate = heredoc.stripTabs ? line.replace(/^\t+/, "") : line;
-      if (candidate === heredoc.delimiter) {
-        pending.shift();
-        output.push("");
-      } else if (!heredoc.quoted && /\$\(|`/.test(line)) output.push(line);
-      else output.push("");
-      continue;
-    }
-    output.push(line);
-    pending.push(...heredocDeclarations(line));
-  }
-  return output.join("\n");
-}
-
-function isPlainTextOutput(segment: string): boolean {
-  const match = segment.match(/^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:command\s+|builtin\s+)?(echo|printf)(?=\s|$)(.*)$/s);
-  if (!match) return false;
-  // Keep scanning shell substitutions: echo/printf may still execute destructive commands inside them.
-  return !/\$\(|`/.test(match[2]);
-}
-
-/** First matching destructive rule, ignoring literal echo/printf and here-doc text. */
+/** First matching destructive rule. Inspect the full command, including here-doc bodies and output arguments. */
 export function findDestructiveCommand(command: string): DestructiveCommandRule | undefined {
-  const withoutLiteralBodies = removeLiteralHeredocBodies(command);
-  for (const { text } of splitSegments(withoutLiteralBodies)) {
-    if (isPlainTextOutput(text)) continue;
+  for (const { text } of splitSegments(command)) {
     const rule = DESTRUCTIVE_PATTERNS.find((candidate) => candidate.pattern.test(text));
     if (rule) return { label: rule.label, reason: rule.reason };
   }

@@ -26,7 +26,7 @@ test("test-runner guard matches the plain-pi fixture table", () => {
   }
 });
 
-test("destructive guard matches plain-pi patterns and avoids literal heredoc and echo text", () => {
+test("destructive guard matches plain-pi patterns including heredoc and echo text", () => {
   for (const fixture of DESTRUCTIVE_GUARD_FIXTURES) {
     assert.equal(findDestructiveCommand(fixture.command)?.label, fixture.label, fixture.name);
   }
@@ -95,7 +95,7 @@ printf 'fake-npx %s\\n' "$*"
 
       let index = 0;
       const turn = async (agent: typeof c, content: string) => {
-        const submission = await store!.send(agent, { content, requestId: `guard-${++index}` }, row.id);
+        const submission = await store!.submitAuthenticatedUserMessage(row, agent, { content, requestId: `guard-${++index}` });
         const settled = await store!.settled(h, submission.id as number, 20_000);
         assert.equal(settled.status, "done");
       };
@@ -296,7 +296,7 @@ test("built-in subagents cannot shed guards when the parent has opted out", asyn
       const session = await store.create({ name: "Guarded built-in child", cwd: fixture.work, model: { provider: "faux", modelId: "echo" } });
       const { row, h, c } = await store.resolveAgent(session.id, "main");
       await store.setExtension(row, c, { name: "durable-guards", enabled: false });
-      const submission = await store.send(c, { content: "launch built-in child", requestId: "launch-built-in-child" }, row.id);
+      const submission = await store.submitAuthenticatedUserMessage(row, c, { content: "launch built-in child", requestId: "launch-built-in-child" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       assert.equal(existsSync(target), true, "the child's destructive command is blocked");
       const child = (await store.agents(row)).find((agent) => agent.kind === "subagent");
@@ -356,7 +356,7 @@ test("delegated expert children inherit destructive guards", async () => {
       fakeDelegateModel(store, `rm -rf ${target}`);
       const session = await store.create({ name: "Guarded delegate", cwd: fixture.work, model: { provider: "faux", modelId: "echo" } });
       const { row, h, c } = await store.resolveAgent(session.id, "main");
-      const submission = await store.send(c, { content: "launch delegated destructive command", requestId: "launch-guarded-delegate" }, row.id);
+      const submission = await store.submitAuthenticatedUserMessage(row, c, { content: "launch delegated destructive command", requestId: "launch-guarded-delegate" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       assert.equal(existsSync(target), true, "the delegated bash command is blocked");
       const child = (await store.agents(row)).find((agent) => agent.kind === "subagent");
@@ -426,7 +426,7 @@ test("ticket worker destructive command blocks its ticket and releases the devic
       await tickets.add(ticket(ticketId));
       await tickets.add(ticket(nextTicketId));
       assert.equal((await tickets.get(ticketId))?.status, "ready", "ticket fixture is stored before starting the run");
-      const submission = await store.send(c, { content: "launch guarded ticket", requestId: "launch-guarded-ticket" }, row.id);
+      const submission = await store.submitAuthenticatedUserMessage(row, c, { content: "launch guarded ticket", requestId: "launch-guarded-ticket" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       await until(async () => (await tickets.get(ticketId))?.status === "blocked", 30_000, "guarded ticket to block");
 
