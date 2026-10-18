@@ -52,6 +52,7 @@ import {
   AgentDoc,
   defineDoc,
   Harness,
+  ROOT_CONVERSATION_ID,
   createRegistry,
   InboxDoc,
   type Conversation,
@@ -74,6 +75,7 @@ import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
 import { onboardEnabledFromEnv, onboardOptionsFromEnv, type OnboardOptions } from "./onboard/config.js";
 import { installOnboard } from "./onboard/index.js";
 import { ExpertIdentity } from "./onboard/experts.js";
+import { commandApprovalFromUserMessage, createGuardApprovalHost, createGuardsExtension, type GuardApprovalHost } from "./onboard/guards.js";
 import { TICKET_RUN_TASK_NAME, TICKET_SCHEDULER_TASK_NAME } from "./onboard/tickets.js";
 
 export const DURABLE_VERSION = "1.0.3";
@@ -215,7 +217,7 @@ export function lockFile(path: string) {
   };
 }
 
-type Opened = { harness: Harness; unlock: () => void; unsubscribe: () => void; jobs: Jobs; addons: Addons; ticketScheduler?: unknown };
+type Opened = { harness: Harness; unlock: () => void; unsubscribe: () => void; jobs: Jobs; addons: Addons; guardApprovals?: GuardApprovalHost; ticketScheduler?: unknown };
 type Resolved = { row: SessionRow; h: Harness; c: Conversation };
 
 const encodeCursor = (cursor: unknown) =>
@@ -613,16 +615,19 @@ export class Store {
       );
       const registry = createRegistry();
       registry.install(CodingTools);
-      const jobs = createJobs({ shared: this.shared, sessionId: row.id });
+      const guardApprovals = this.onboardOptions ? createGuardApprovalHost() : undefined;
+      const guards = guardApprovals ? createGuardsExtension(guardApprovals) : undefined;
+      const jobs = createJobs({ shared: this.shared, sessionId: row.id, childExtensions: guards ? [guards] : [] });
       const compaction = () => this.compactionOf(row.id);
       const playground = createPlayground(this.shared, row.id, this.spawnSession, jobs);
       registry.install(playground);
       // Custom extensions are installed but not selected: an agent turns them on in its own selection.
-      const addons = createAddons({ offline: this.options.provider === "faux" });
+      const addons = createAddons({ offline: this.options.provider === "faux", guards });
       for (const extension of addons.list) registry.install(extension);
       const onboardExtensions = this.onboardOptions
         ? installOnboard(registry, this.onboardOptions, {
             childBaseExtensions: [CodingTools],
+            guards: guards!,
             shared: this.shared,
             device: this.name,
             nameConversation: (conversationId, name) => this.setAgentName(row, conversationId, name),
@@ -685,7 +690,7 @@ export class Store {
       row.model = rootModel.modelId;
       this.catalog.prepare("UPDATE sessions SET provider=?,model=? WHERE id=?").run(row.provider, row.model, row.id);
       const unsubscribe = harness.subscribeCommits(() => this.notify());
-      this.opened.set(row.id, { harness, unlock, unsubscribe, jobs, addons, ticketScheduler });
+      this.opened.set(row.id, { harness, unlock, unsubscribe, jobs, addons, guardApprovals, ticketScheduler });
       this.errors.delete(row.id);
       if (create) harness.resume();
       return harness;
@@ -995,7 +1000,11 @@ export class Store {
     const fork = await c.fork(at as EntryId, { ownership: { kind: "ownerless" } }, ctx);
     await this.reconcileReadOnlyPolicy(h, fork, this.onboardOptions !== undefined);
     const agent = await fork.agent(ctx);
-    await fork.configure({ model: this.routedModel(agent.model) }, ctx);
+    const guard = this.opened.get(row.id)?.addons.all["durable-guards"];
+    const extensions = guard && !agent.extensions.some((extension) => extension.name === guard.name)
+      ? [...agent.extensions, guard]
+      : undefined;
+    await fork.configure({ model: this.routedModel(agent.model), ...(extensions ? { extensions } : {}) }, ctx);
     if (typeof body.name === "string" && body.name.trim()) this.setAgentName(row, fork.id as number, body.name);
     this.notify();
     return this.agentSummary(row, fork);
@@ -1035,13 +1044,16 @@ export class Store {
     return (await this.agentDetail(row, c)).config;
   }
 
-  async send(c: Conversation, body: Record<string, unknown>) {
+  async send(c: Conversation, body: Record<string, unknown>, sessionId?: string) {
     if (typeof body.content !== "string" || !body.content.trim() || body.content.length > 100000)
       throw invalid("content must be a message under 100,000 characters");
     const whenBusy = (body.whenBusy ?? "followUp") as WhenBusy;
     if (!["steer", "followUp", "reject"].includes(whenBusy)) throw invalid("whenBusy must be followUp, steer or reject");
     if (typeof body.requestId !== "string" || !body.requestId || body.requestId.length > 128)
       throw invalid("requestId is required (≤128 chars) so retries never submit twice");
+    const approvalHash = commandApprovalFromUserMessage(body.content);
+    if (approvalHash && sessionId && c.id === ROOT_CONVERSATION_ID)
+      this.opened.get(sessionId)?.guardApprovals?.approve(approvalHash, c.id);
     return c.submit({ type: "input", content: body.content, requestId: body.requestId, whenBusy }, ctx);
   }
 
@@ -1178,10 +1190,11 @@ export class Store {
 
   async extensionsOf(row: SessionRow, c: Conversation): Promise<AgentExtensions> {
     const active = new Set((await c.agent(ctx)).extensions.map((e) => e.name));
+    const available = this.opened.get(row.id)?.addons.all ?? {};
     const checked = (await this.harness(row).snapshot(PromptChecklist, c.id, ctx))?.enabled ?? [PROMPTS[0].id];
     return {
       builtIn: [...active].filter((name) => !ADDON_INFO.some((a) => a.name === name)),
-      extensions: ADDON_INFO.map((info) => ({
+      extensions: ADDON_INFO.filter((info) => Object.hasOwn(available, info.name)).map((info) => ({
         ...info,
         enabled: active.has(info.name),
         ...(info.name === "system-prompts"

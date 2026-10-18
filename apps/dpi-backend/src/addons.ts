@@ -83,6 +83,12 @@ async function judgeOffline(command: string): Promise<Verdict> {
 
 export const ADDON_INFO: Omit<HarnessExtensionInfo, "enabled" | "prompts">[] = [
   {
+    name: "durable-guards",
+    title: "Durable safety guards",
+    description:
+      "Rewrites unsafe test-runner commands and blocks destructive bash commands until the root user approves the exact command once in chat.",
+  },
+  {
     name: "system-prompts",
     title: "System prompts",
     description: "Adds the checked prompts to this agent's system prompt. A change applies from the next request.",
@@ -95,7 +101,7 @@ export const ADDON_INFO: Omit<HarnessExtensionInfo, "enabled" | "prompts">[] = [
   },
 ];
 
-export function createAddons(opts: { offline: boolean }) {
+export function createAddons(opts: { offline: boolean; guards?: Extension }) {
   const prompts = defineExtension({
     name: "system-prompts",
     sections: [
@@ -133,7 +139,8 @@ export function createAddons(opts: { offline: boolean }) {
     ],
   });
   const all: Record<string, Extension> = { "system-prompts": prompts, "jev-damage-control": jev };
-  return { all, list: [prompts, jev] };
+  if (opts.guards) all[opts.guards.name] = opts.guards;
+  return { all, list: [prompts, jev, ...(opts.guards ? [opts.guards] : [])] };
 }
 
 export type Addons = ReturnType<typeof createAddons>;

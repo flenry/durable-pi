@@ -11,8 +11,10 @@ import { createRemindExtension } from "./remind.js";
 import type { TicketStateHost } from "./tickets.js";
 
 export interface OnboardInstallContext {
-  /** Core capabilities that expert children need in addition to memory, skills, and web. */
+  /** Core capabilities that expert children need in addition to memory, skills, web, and durable guards. */
   childBaseExtensions: readonly Extension[];
+  /** Host-created guard instance shared by roots, forks, delegated children and ticket workers. */
+  guards: Extension;
   /** Device-wide persisted App State; tickets use it as the single queue for this device. */
   shared: TicketStateHost;
   device: string;
@@ -27,18 +29,19 @@ export function installOnboard(registry: Registry, options: OnboardOptions, cont
   const memory = createMemoryExtension(client);
   const web = createWebExtension();
   const extensions: Extension[] = [
+    context.guards,
     skills,
     memory,
     web,
     createPlaybookExtension(options.setupDir),
     createExpertsExtension(client, {
       maxChildren: options.maxChildren,
-      childExtensions: [...context.childBaseExtensions, memory, skills, web],
+      childExtensions: [...context.childBaseExtensions, context.guards, memory, skills, web],
       nameConversation: context.nameConversation,
     }),
     createTicketsExtension(context.shared, {
       device: context.device,
-      childExtensionNames: [...context.childBaseExtensions, memory, skills, web].map((extension) => extension.name),
+      childExtensionNames: [...context.childBaseExtensions, context.guards, memory, skills, web].map((extension) => extension.name),
       memory: client,
       schedulerEnabled: options.ticketScheduler,
       nameConversation: context.nameConversation,

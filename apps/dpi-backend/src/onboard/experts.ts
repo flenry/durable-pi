@@ -25,7 +25,7 @@ import { runBoundedProcess } from "./bounded-process.js";
 
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const DEFAULT_GIT_MAX_OUTPUT_BYTES = 1_000_000;
-const CHILD_EXTENSION_NAMES = new Set(["coding-tools", "memory", "skills", "web"]);
+const CHILD_EXTENSION_NAMES = new Set(["coding-tools", "durable-guards", "memory", "skills", "web"]);
 
 export interface ExpertWorktree {
   [key: string]: string;
@@ -148,6 +148,8 @@ function instructionsFor(profile: ExpertProfile): string {
       "## Durable expert memory",
       `These best practices belong to you (${profile.name}). Record concise cross-project learnings with ` +
         "`memory_note(scope: \"expert\", topic, entry)` and consolidate with `memory_rewrite(scope: \"expert\", topic, content)`.",
+      "## Durable command guards",
+      "Unsafe test commands are rewritten or blocked. Destructive bash commands are blocked until a human approves the exact command in the root chat; never self-approve, alter the command to evade the guard, or retry a blocked destructive operation. Unattended ticket workers must report `TICKET_STATUS: BLOCKED: command needs approval`.",
       "The host supplies your trusted identity; never pass or claim `actor` or `self`. You may write only your own expert store and may not pin. Use `scope: \"inbox\"` for suggestions to another expert.",
     ].join("\n\n"),
   ].filter(Boolean).join("\n\n");

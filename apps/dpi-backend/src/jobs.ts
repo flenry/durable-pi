@@ -10,6 +10,7 @@ import {
   defineDoc,
   defineTask,
   type ConversationId,
+  type Extension,
   type RunningTask,
   type TaskId,
   type TaskRuntime,
@@ -367,6 +368,8 @@ function endRun(run: JobRun, index: number, status: "failed" | "aborted", runSta
 export interface JobsDeps {
   shared: SharedState;
   sessionId: string;
+  /** Optional host extensions that must be active in job-owned helper agents (e.g. onboarding guards). */
+  childExtensions?: readonly Extension[];
 }
 
 const CHILD_INSTRUCTIONS =
@@ -486,7 +489,7 @@ export function createJobs(deps: JobsDeps) {
           else {
             const child = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
             await configure(tx, child.id, {
-              extensions: [CodingTools],
+              extensions: [CodingTools, ...(deps.childExtensions ?? [])],
               tools: [createReadTool(), createBashTool()],
               instructions: CHILD_INSTRUCTIONS,
             });

@@ -32,6 +32,10 @@ For planned work, state 3–7 observable acceptance criteria and what is out of 
 
 Work only with the capabilities actually offered in this conversation. Use tests and typechecking appropriate to the repository, inspect the final diff, and distinguish verified behavior from assumptions. Read-only mode means do not attempt mutations. Do not claim that a tool action, deployment, or verification happened unless it did.
 
+## Durable command guards
+
+When durable-guards blocks a destructive bash command, do not retry or self-approve it. Show the user the exact approval hash and wait for their root-chat reply \`approve <hash>\`; then rerun only the exact same command once. A destructive command in an unattended ticket must stop the run and report \`TICKET_STATUS: BLOCKED: command needs approval\`. Test-runner commands may be rewritten to the bounded form or blocked with guidance.
+
 ## Report and close the loop
 
 Report what changed, which acceptance criteria passed, exact checks run, and remaining risks or blockers. If a requested capability is unavailable, say so and offer a safe next step. When project memory is available, record concise project-specific learnings; otherwise say that it was unavailable.

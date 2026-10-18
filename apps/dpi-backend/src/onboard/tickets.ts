@@ -20,6 +20,8 @@ import { realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { messageText } from "../../../dpi-sdk/src/transcript.js";
 import type { AppState } from "../../../dpi-sdk/src/app-state.js";
+import type { WireMessage } from "../../../dpi-sdk/src/api.js";
+import { GUARD_BLOCKED_MARKER } from "./guards.js";
 import { runBoundedProcess, type BoundedProcessResult } from "./bounded-process.js";
 import { assertPristineWorktree, durableThinkingLevel, ExpertIdentity } from "./experts.js";
 import { normalizeRemote } from "./project-key.js";
@@ -788,6 +790,18 @@ function shortError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).split("\n")[0].slice(0, 500);
 }
 
+function guardBlocker(entries: readonly { model?: readonly unknown[] }[]): string | undefined {
+  for (const entry of entries) {
+    for (const message of entry.model ?? []) {
+      if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "toolResult") continue;
+      const text = messageText(message as WireMessage);
+      const marker = text.indexOf(GUARD_BLOCKED_MARKER);
+      if (marker >= 0) return text.slice(marker + GUARD_BLOCKED_MARKER.length).trim();
+    }
+  }
+  return undefined;
+}
+
 export function ticketBlocker(result: string): string | undefined {
   return result.split(/\r?\n/).find((line) => /^(?:NEEDS HUMAN\s*:|BLOCKED\s*:|TICKET_STATUS\s*:\s*BLOCKED(?:\s*:|$))/i.test(line.trim()))?.trim();
 }
@@ -912,6 +926,11 @@ async function runPlanPhase(
     }
     // `runtime.entry` reads the ticket task's conversation; worker answers live in the child conversation.
     const childContext = await runtime.context(childId as ConversationId, ctx, settled.answer);
+    const guarded = guardBlocker(childContext.entries);
+    if (guarded) {
+      await blockRun(task, runtime, ctx, store, guarded, now());
+      return;
+    }
     const answer = childContext.entries.find((entry) => entry.id === settled.answer);
     const result = answer?.model?.filter((message) => message.role === "assistant").map((message) => messageText(message as never)).join("\n").trim();
     if (!result) {
@@ -977,7 +996,7 @@ async function ensureTicketChild(
     agent.thinkingLevel = thinkingLevel;
     agent.cwd = current.state.checkpoint.worktree ?? "";
     agent.extensions = childExtensionNames;
-    agent.instructions = [profileBody.trim(), `## Ticket ${task.input.ticketId}`, `Implement only slice ${slice.id}. Work only in the ticket worktree. Do not push or merge.`, "Return exact verification commands one per line as CHECK: <command>, criteria verified, and any unresolved blocker. Limit attempts to two per acceptance criterion. End with TICKET_STATUS: COMPLETE only when assigned criteria pass, or TICKET_STATUS: BLOCKED: <exact need> when they do not."].join("\n\n");
+    agent.instructions = [profileBody.trim(), `## Ticket ${task.input.ticketId}`, `Implement only slice ${slice.id}. Work only in the ticket worktree. Do not push or merge.`, "Return exact verification commands one per line as CHECK: <command>, criteria verified, and any unresolved blocker. Limit attempts to two per acceptance criterion. Never retry a destructive command blocked by durable-guards; stop and report TICKET_STATUS: BLOCKED: command needs approval. End with TICKET_STATUS: COMPLETE only when assigned criteria pass, or TICKET_STATUS: BLOCKED: <exact need> when they do not."].join("\n\n");
     if (denied.length) {
       const tools = agent.tools;
       if (tools === undefined) agent.tools = { remove: denied };
@@ -1006,7 +1025,7 @@ function ticketSlicePrompt(ticket: Ticket, slice: TicketSlice, phase: string, wo
     `Dependencies integrated: ${slice.dependsOn.join(", ") || "none"}.`,
     `Acceptance criteria:\n${ticket.acceptanceCriteria.map((item, i) => `${i + 1}. ${item}`).join("\n")}`,
     slice.verify ? `Verification: ${slice.verify}` : "Run the most relevant checks and report each exact command on a separate `CHECK: <command>` line.",
-    "Work in the provided ticket worktree only. Fix failures with no more than two attempts per acceptance criterion. Do not finish until you report criteria status and remaining risks. Return each exact verification command on a `CHECK: <command>` line. End with `TICKET_STATUS: COMPLETE` only when the criteria pass, or `TICKET_STATUS: BLOCKED: <exact need>` when they do not.",
+    "Work in the provided ticket worktree only. Fix failures with no more than two attempts per acceptance criterion. Do not finish until you report criteria status and remaining risks. Never retry a destructive command blocked by durable-guards; stop and report `TICKET_STATUS: BLOCKED: command needs approval`. Return each exact verification command on a `CHECK: <command>` line. End with `TICKET_STATUS: COMPLETE` only when the criteria pass, or `TICKET_STATUS: BLOCKED: <exact need>` when they do not.",
   ].join("\n\n");
 }
 

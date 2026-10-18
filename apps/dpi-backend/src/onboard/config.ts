@@ -1,6 +1,6 @@
 // Onboard configuration: everything comes from env so the fork holds no personal paths or hosts.
 //
-//   DPI_ONBOARD         1 opts in to Phase 1 extensions; 0 or unset preserves legacy behavior
+//   DPI_ONBOARD         1 opts in to onboarding extensions and enables durable guards by default; 0 or unset preserves legacy behavior
 //   PI_SETUP_DIR        the pi setup checkout (skills, experts, playbook, memory CLI); default ~/.pi
 //   DPI_MEMORY          local | ssh | off — where the memory CLI runs (default local)
 //   DPI_MEMORY_HOST     ssh alias of the memory host when DPI_MEMORY=ssh (e.g. memory-host)

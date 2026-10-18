@@ -622,7 +622,7 @@ test("faux provider receives a fully configured durable reviewer child", async (
       const childAgent = await child.agent(context);
       assert.deepEqual(childAgent.model, { provider: "faux", modelId: "echo" });
       assert.equal(childAgent.thinkingLevel, "high");
-      assert.deepEqual(childAgent.extensions.map((extension) => extension.name), ["coding-tools", "memory", "skills", "web"]);
+      assert.deepEqual(childAgent.extensions.map((extension) => extension.name), ["coding-tools", "durable-guards", "memory", "skills", "web"]);
       assert.match(childAgent.instructions ?? "", /Review the work/);
       assert.match(childAgent.instructions ?? "", /Cite evidence/);
       assert.ok(details.worktree);

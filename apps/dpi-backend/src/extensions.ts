@@ -398,13 +398,21 @@ export function createPlayground(shared: SharedState, sessionId: string, spawn: 
     parameters: Type.Object({ task: Type.String() }),
     replay: "safe",
     execute: async (args, api, ctx) => {
+      const parent = await api.agent(ctx);
+      const guard = api.registry.extension("durable-guards");
+      const childExtensions = guard && !parent.extensions.some((extension) => extension.name === guard.name)
+        ? [...parent.extensions, guard]
+        : parent.extensions;
       const id = await api.commit(async (tx) => {
         const found = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
         if (found) return found.id;
         const child = await tx.createConversation({
           ownership: { kind: "task", taskId: api.taskId },
         });
-        await configure(tx, child.id, { tools: { remove: [subagent] } });
+        await configure(tx, child.id, {
+          tools: { remove: [subagent] },
+          ...(guard ? { extensions: childExtensions } : {}),
+        });
         return child.id;
       }, ctx);
       await api.details({ conversationId: id }, ctx);
