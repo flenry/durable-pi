@@ -86,6 +86,30 @@ try {
   await composer.press("ArrowUp");
   await expect(options.nth(0)).toHaveAttribute("aria-selected", "true");
   await expect(options.nth(1)).toHaveAttribute("aria-selected", "false");
+  // Arrowing past the visible area scrolls the highlighted option into view.
+  const menuOptions = page.locator(".slash-menu [role=option]");
+  const total = await menuOptions.count();
+  for (let i = 0; i < total - 1; i++) await composer.press("ArrowDown");
+  await expect(menuOptions.nth(total - 1)).toHaveAttribute("aria-selected", "true");
+  assert.ok(
+    await page.locator(".slash-menu").evaluate((menu) => {
+      const active = menu.querySelector('[aria-selected="true"]');
+      const m = menu.getBoundingClientRect();
+      const a = active.getBoundingClientRect();
+      return menu.scrollHeight > menu.clientHeight && a.top >= m.top && a.bottom <= m.bottom;
+    }),
+    "the highlighted last option is scrolled into the visible menu area",
+  );
+  await composer.press("ArrowDown"); // wraps to the top and scrolls back
+  await expect(menuOptions.nth(0)).toHaveAttribute("aria-selected", "true");
+  assert.ok(
+    await page.locator(".slash-menu").evaluate((menu) => {
+      const a = menu.querySelector('[aria-selected="true"]').getBoundingClientRect();
+      const m = menu.getBoundingClientRect();
+      return a.top >= m.top && a.bottom <= m.bottom;
+    }),
+    "wrapping to the first option scrolls back to the top",
+  );
   assert.equal(
     await page.locator(".slash-menu").evaluate((menu) => getComputedStyle(menu).backgroundColor),
     "rgb(37, 26, 27)",

@@ -63,6 +63,10 @@ watch(
   },
 );
 watch(skillCatalog, () => (menuIndex.value = 0));
+// Keep the highlighted option visible when arrowing past the menu's visible area (it scrolls).
+watch(menuIndex, (i) =>
+  nextTick(() => document.getElementById(`slash-option-${i}`)?.scrollIntoView({ block: "nearest" })),
+);
 
 function completeSkill(name: string) {
   const value = `/${name} `;
