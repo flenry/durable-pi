@@ -131,13 +131,70 @@ test("sessions, browse, names, forks, jobs, restart recovery, approval, interrup
   }
 });
 
+test("submission admissions in separate sessions do not share a lock", async () => {
+  const t = await tempStore();
+  const store = await t.open();
+  try {
+    const firstSession = await store.create({ name: "First", cwd: t.work, model: faux });
+    const secondSession = await store.create({ name: "Second", cwd: t.work, model: faux });
+    const first = await store.resolveAgent(firstSession.id, "main");
+    const second = await store.resolveAgent(secondSession.id, "main");
+    assert.equal(first.c.id, second.c.id, "independent session roots use the same conversation ID");
+
+    const trySubmission = async (
+      name: string,
+      submit: (row: typeof first.row, c: typeof first.c, body: Record<string, unknown>) => Promise<{ id: number | bigint }>,
+    ) => {
+      let enterSlow!: () => void;
+      let releaseSlow!: () => void;
+      const slowEntered = new Promise<void>((resolve) => { enterSlow = resolve; });
+      const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+      const slowConversation = new Proxy(first.c, {
+        get(target, property, receiver) {
+          if (property === "submit") {
+            return async (...args: Parameters<typeof target.submit>) => {
+              enterSlow();
+              await slowGate;
+              return target.submit(...args);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const requestId = `cross-session-${name}`;
+      const firstSubmission = submit(first.row, slowConversation, { content: "slow admission", requestId });
+      let secondSubmission: Promise<{ id: number | bigint }> | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await slowEntered;
+        secondSubmission = submit(second.row, second.c, { content: "independent admission", requestId });
+        const admittedBeforeRelease = await Promise.race([
+          secondSubmission.then(() => true),
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 1000); }),
+        ]);
+        assert.equal(admittedBeforeRelease, true, `${name}: the second session should not wait for the first`);
+      } finally {
+        if (timer) clearTimeout(timer);
+        releaseSlow();
+        if (secondSubmission) await Promise.allSettled([firstSubmission, secondSubmission]);
+      }
+    };
+
+    await trySubmission("send", (row, c, body) => store.send(row.id, c, body));
+    await trySubmission("authenticated", (row, c, body) => store.submitAuthenticatedUserMessage(row, c, body));
+  } finally {
+    await store.close();
+    await t.cleanup();
+  }
+});
+
 test("start_session: an agent starts an independent session, once per tool call", async () => {
   const t = await tempStore();
   const store = await t.open();
   try {
     const parent = await store.create({ name: "Parent", cwd: "project", model: faux, thinkingLevel: "minimal" });
     const { h, c } = await store.resolveAgent(parent.id, "main");
-    const sent = await store.send(c, { content: "spawn: Child | hello child", requestId: "spawn-1" });
+    const sent = await store.send(parent.id, c, { content: "spawn: Child | hello child", requestId: "spawn-1" });
     const answer = await store.settled(h, sent.id as number, 15000);
     assert.equal(answer.status, "done");
 
@@ -176,7 +233,7 @@ test("custom extensions: jev-damage-control blocks rm -rf only while on; system-
     const { row, h, c } = await store.resolveAgent(session.id, "main");
     let n = 0;
     const turn = async (content: string) => {
-      const submission = await store.send(c, { content, requestId: `ext-${++n}` });
+      const submission = await store.send(row.id, c, { content, requestId: `ext-${++n}` });
       assert.equal((await store.settled(h, submission.id as number, 20000)).status, "done");
     };
     const systemText = async () =>
@@ -243,7 +300,7 @@ test("read only: the agent is offered only tools that read; turning it off resto
       detail.tools.filter((x) => x.writes).map((x) => x.name).sort(),
     );
     assert.ok((await offered()).includes("read") && (await offered()).includes("search_history"));
-    const submission = await store.send(c, { content: "!rm -rf kept", requestId: "ro-1" });
+    const submission = await store.send(row.id, c, { content: "!rm -rf kept", requestId: "ro-1" });
     assert.equal((await store.settled(h, submission.id as number, 20000)).status, "done");
     assert.ok(existsSync(join(t.work, "kept")), "bash never ran");
     const result = (await store.entries(c, undefined, 5)).items.find((e) => e.kind === "pi.tool-result");

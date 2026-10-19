@@ -572,7 +572,7 @@ export class Store {
         );
     if (!input.prompt) return { session };
     const { c } = await this.resolveAgent(session.id, "main");
-    const submission = await this.send(c, { content: input.prompt, requestId: `${input.key}:prompt` });
+    const submission = await this.send(session.id, c, { content: input.prompt, requestId: `${input.key}:prompt` });
     return { session, submissionId: submission.id as number };
   };
 
@@ -904,6 +904,10 @@ export class Store {
     }, ctx);
   }
 
+  private submissionKey(sessionId: string, conversationId: ConversationId, requestId: string) {
+    return JSON.stringify([sessionId, conversationId, requestId]);
+  }
+
   private async serializeSubmission<T>(key: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.submissionTails.get(key) ?? Promise.resolve();
     let release!: () => void;
@@ -1108,9 +1112,10 @@ export class Store {
   }
 
   /** Internal/model-origin sends have no approval capability. */
-  async send(c: Conversation, body: Record<string, unknown>) {
+  async send(sessionId: string, c: Conversation, body: Record<string, unknown>) {
     const input = this.inputSubmission(body);
-    return this.serializeSubmission(`${c.id}:${input.requestId}`, () => c.submit({ type: "input", ...input }, ctx));
+    const key = this.submissionKey(sessionId, c.id, input.requestId);
+    return this.serializeSubmission(key, () => c.submit({ type: "input", ...input }, ctx));
   }
 
   /** The authenticated HTTP user-message route is the only caller allowed to grant a root-chat approval. */
@@ -1118,7 +1123,7 @@ export class Store {
     const input = this.inputSubmission(body);
     const approvalHash = c.id === ROOT_CONVERSATION_ID ? commandApprovalFromUserMessage(input.content) : undefined;
     const h = this.harness(row);
-    const key = `${c.id}:${input.requestId}`;
+    const key = this.submissionKey(row.id, c.id, input.requestId);
     return this.serializeSubmission(key, async () => {
       const existing = await h.commit((tx) => tx.submissionByRequest(c.id, input.requestId), ctx);
       const submission = await c.submit({ type: "input", ...input }, ctx);

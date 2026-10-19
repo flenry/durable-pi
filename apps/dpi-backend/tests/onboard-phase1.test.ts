@@ -225,7 +225,7 @@ test("new opt-in requests include temp skills, memory, and root playbook; opt-ou
       for (const name of ["load_skill", "memory_note", "memory_rewrite", "memory_read", "fetch_url", "web_search"])
         assert.ok(offered.has(name), `${name} is offered to the new opt-in root`);
 
-      const submission = await store.send(c, { content: "inspect the available setup", requestId: "phase1-root-request" });
+      const submission = await store.send(row.id, c, { content: "inspect the available setup", requestId: "phase1-root-request" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       const rootRequest = JSON.stringify(await store.activeEntries(c));
       assert.match(rootRequest, /fixture-skill.*temporary integration skill/i);
@@ -236,7 +236,7 @@ test("new opt-in requests include temp skills, memory, and root playbook; opt-ou
       const nonRoot = await store.createAgent(row, { from: "main", name: "phase1-non-root" });
       const child = await store.resolveAgent(row.id, String(nonRoot.id));
       assert.notEqual(child.c.id, ROOT_CONVERSATION_ID);
-      const childSubmission = await store.send(child.c, { content: "inspect setup without root guidance", requestId: "phase1-non-root-request" });
+      const childSubmission = await store.send(child.row.id, child.c, { content: "inspect setup without root guidance", requestId: "phase1-non-root-request" });
       assert.equal((await store.settled(child.h, childSubmission.id as number, 20_000)).status, "done");
       const nonRootRequest = JSON.stringify(await store.activeEntries(child.c));
       assert.match(nonRootRequest, /fixture-skill.*temporary integration skill/i);
@@ -266,7 +266,7 @@ test("new opt-in requests include temp skills, memory, and root playbook; opt-ou
       const detail = await legacyStore.agentDetail(row, c);
       assert.deepEqual(detail.extensions, ["coding-tools", "playground"]);
       assert.equal(detail.tools.some((tool) => ["load_skill", "memory_note", "fetch_url"].includes(tool.name)), false);
-      const submission = await legacyStore.send(c, { content: "legacy request", requestId: "phase1-opt-out-request" });
+      const submission = await legacyStore.send(row.id, c, { content: "legacy request", requestId: "phase1-opt-out-request" });
       assert.equal((await legacyStore.settled(h, submission.id as number, 20_000)).status, "done");
       const legacyRequest = JSON.stringify(await legacyStore.activeEntries(c));
       assert.doesNotMatch(legacyRequest, /Available skills|Project memory|DURABLE_ONBOARDING_PLAYBOOK_SENTINEL/);

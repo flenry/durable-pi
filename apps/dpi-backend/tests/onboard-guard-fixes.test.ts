@@ -103,7 +103,7 @@ test("real guarded bash calls block quoted and unquoted heredocs, background lis
         const target = join(fixture.work, `guard-syntax-${index}`);
         await mkdir(target);
         command = makeCommand(target);
-        const submission = await store.send(c, { content: `probe ${index}`, requestId: `syntax-${index}` });
+        const submission = await store.send(session.id, c, { content: `probe ${index}`, requestId: `syntax-${index}` });
         assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
         assert.equal(existsSync(target), true, `the guard blocked ${index}: ${command}`);
       }

@@ -294,7 +294,7 @@ test("ticket build resumes after Store close/reopen without duplicate children, 
       await tickets.add(makeTicket(repo, ticketId));
       await tickets.add(makeTicket(repo, "20261015-1031-next-ticket"));
       const { h, c } = await store.resolveAgent(session.id, "main");
-      const submission = await store.send(c, { content: "launch durable ticket", requestId: "launch-durable-ticket" });
+      const submission = await store.send(session.id, c, { content: "launch durable ticket", requestId: "launch-durable-ticket" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       await withTimeout(firstBuildStarted, 20_000, "first delegated build model request");
 
@@ -407,7 +407,7 @@ test("legal unrelated App State growth cannot strand a faulted ticket run", asyn
       await tickets.add(makeTicket(repo, ticketId));
       await tickets.add(makeTicket(repo, "20261015-1031-after-pressure"));
       const { h, c } = await store.resolveAgent(session.id, "main");
-      const submission = await store.send(c, { content: "launch durable ticket", requestId: "launch-pressure-ticket" });
+      const submission = await store.send(session.id, c, { content: "launch durable ticket", requestId: "launch-pressure-ticket" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       await withTimeout(firstBuildStarted, 20_000, "ticket worker to start before state growth");
       const running = await tickets.get(ticketId);
@@ -481,7 +481,7 @@ test("reminders fire once through the durable timer after Store restart and canc
       const fireAt = Date.now() + 4_000;
       requests.set("schedule-reminder:fire", { when: fireAt, message: "fire after restart" });
       let { row, h, c } = await store.resolveAgent(session.id, "main");
-      const scheduled = await store.send(c, { content: "schedule-reminder:fire", requestId: "schedule-reminder-fire" });
+      const scheduled = await store.send(session.id, c, { content: "schedule-reminder:fire", requestId: "schedule-reminder-fire" });
       assert.equal((await store.settled(h, scheduled.id as number, 20_000)).status, "done");
       const fireTask = await reminderTaskFor(store, session.id, fireAt);
       const fireInput = fireTask.input as { id: string; when: number };
@@ -511,11 +511,11 @@ test("reminders fire once through the durable timer after Store restart and canc
       const cancelAt = Date.now() + 4_000;
       requests.set("schedule-reminder:cancel", { when: cancelAt, message: "must remain cancelled" });
       ({ row, h, c } = await store.resolveAgent(session.id, "main"));
-      const scheduledForCancel = await store.send(c, { content: "schedule-reminder:cancel", requestId: "schedule-reminder-cancel" });
+      const scheduledForCancel = await store.send(session.id, c, { content: "schedule-reminder:cancel", requestId: "schedule-reminder-cancel" });
       assert.equal((await store.settled(h, scheduledForCancel.id as number, 20_000)).status, "done");
       const cancelTask = await reminderTaskFor(store, session.id, cancelAt);
       const cancelInput = cancelTask.input as { id: string; when: number };
-      const cancel = await store.send(c, { content: `cancel-reminder:${cancelInput.id}`, requestId: "cancel-durable-reminder" });
+      const cancel = await store.send(session.id, c, { content: `cancel-reminder:${cancelInput.id}`, requestId: "cancel-durable-reminder" });
       assert.equal((await store.settled(h, cancel.id as number, 20_000)).status, "done");
       await waitUntil(async () => (await h.getTask(cancelTask.id, context))?.state.status === "terminal", 5_000, "cancelled reminder task to stop");
       assert.ok(Date.now() < cancelAt, "cancellation completes before the reminder is due");

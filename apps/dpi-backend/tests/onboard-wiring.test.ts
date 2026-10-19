@@ -124,7 +124,7 @@ test("opt-in installs onboarding for new roots, filters memory mutations read-on
         for (const tool of ["load_skill", "memory_note", "memory_rewrite", "memory_read", "fetch_url", "web_search", "delegate", "add_ticket", "list_tickets", "run_ticket", "update_ticket", "remind", "list_reminders", "cancel_reminder"])
           assert.ok(offered.has(tool), tool);
 
-        const submission = await store!.send(c, { content: "hello", requestId: "onboard-root-prompt" });
+        const submission = await store!.send(session.id, c, { content: "hello", requestId: "onboard-root-prompt" });
         assert.equal((await store!.settled(h, submission.id as number, 20000)).status, "done");
         const rootPrompt = systemText(await store!.activeEntries(c));
         assert.match(rootPrompt, /Test Playbook Override/);
@@ -399,7 +399,7 @@ test("missing setup degrades gracefully without creating a local memory tree", a
       store = await t.open();
       const session = await store!.create({ name: "Missing setup", cwd: t.work, model: faux });
       const { row, h, c } = await store!.resolveAgent(session.id, "main");
-      const submission = await store!.send(c, { content: "hello", requestId: "missing-setup-prompt" });
+      const submission = await store!.send(session.id, c, { content: "hello", requestId: "missing-setup-prompt" });
       assert.equal((await store!.settled(h, submission.id as number, 20000)).status, "done");
       const prompt = systemText(await store!.activeEntries(c));
       assert.match(prompt, /No skills found/);
