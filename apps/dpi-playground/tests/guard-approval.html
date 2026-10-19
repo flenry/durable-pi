@@ -10,25 +10,27 @@
     <div id="app"></div>
     <script type="module">
       import { createApp } from "vue";
+      import { guardApprovalStates } from "/src/client/guard-approval.ts";
       import TranscriptItem from "/src/components/TranscriptItem.vue";
       import { selected } from "/src/client/store";
 
       selected.value = { deviceId: "local", sessionId: "approval-test", agentId: 1 };
-      const hash = "a".repeat(64);
-      const result = {
-        kind: "tool-result",
-        id: 1,
-        name: "bash",
-        text:
-          `DPI_GUARD_BLOCKED: Blocked destructive command (rm -rf): ` +
-          `Recursive force-delete. The user must reply exactly: approve ${hash}. Do not self-approve.`,
-        isError: true,
-      };
-      const guardApproval = {
-        request: { hash, label: "rm -rf", reason: "Recursive force-delete." },
-        status: "pending",
-      };
-      createApp(TranscriptItem, { item: result, guardApproval }).mount("#app");
+      const response = await fetch("/__guard_approval_fixture");
+      if (!response.ok) throw new Error("Could not load the captured transcript fixture");
+      const transcript = await response.json();
+      const itemIndex = transcript.items.findIndex(
+        (item) =>
+          item.kind === "assistant" &&
+          item.blocks.some(
+            (block) => block.type === "tool" && typeof block.call.result === "string",
+          ),
+      );
+      if (itemIndex < 0) throw new Error("Captured transcript has no assistant tool result block");
+      createApp(TranscriptItem, {
+        item: transcript.items[itemIndex],
+        itemIndex,
+        guardApprovals: guardApprovalStates(transcript.items),
+      }).mount("#app");
     </script>
   </body>
 </html>

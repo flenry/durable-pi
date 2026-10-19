@@ -7,6 +7,10 @@ const require = createRequire(import.meta.url);
 const { chromium, expect } = require("@playwright/test");
 const root = resolve(import.meta.dirname, "../apps/dpi-playground-fe");
 const fixture = resolve(import.meta.dirname, "guard-approval.html");
+const transcriptFixture = resolve(
+  import.meta.dirname,
+  "../../../docs/workers/polish/real-blocked-transcript.json",
+);
 const vite = await createServer({
   configFile: resolve(root, "vite.config.ts"),
   server: { host: "127.0.0.1", port: 0, strictPort: false },
@@ -14,6 +18,16 @@ const vite = await createServer({
     {
       name: "guard-approval-test-fixture",
       configureServer(server) {
+        server.middlewares.use("/__guard_approval_fixture", async (_req, res, next) => {
+          try {
+            const { readFile } = await import("node:fs/promises");
+            res.statusCode = 200;
+            res.setHeader("content-type", "application/json; charset=utf-8");
+            res.end(await readFile(transcriptFixture, "utf8"));
+          } catch (error) {
+            next(error);
+          }
+        });
         server.middlewares.use("/__guard_approval_test", async (_req, res, next) => {
           try {
             const { readFile } = await import("node:fs/promises");
@@ -39,7 +53,7 @@ try {
   await vite.listen();
   const address = vite.httpServer?.address();
   if (!address || typeof address === "string") throw new Error("Vite did not bind a local port");
-  const hash = "a".repeat(64);
+  const hash = "527e6747ce5a7156cea93abc30891efc199ee75b99fc2540bd86c7f341f3cb3c";
   const requests = [];
   browser = await chromium.launch({ channel: "chrome", headless: true });
   const page = await browser.newPage({ viewport: { width: 375, height: 812 } });
@@ -63,8 +77,12 @@ try {
   await page.goto(`http://127.0.0.1:${address.port}/__guard_approval_test`);
   await expect(page.getByText("Destructive command blocked")).toBeVisible();
   await expect(page.getByText("rm -rf", { exact: true })).toBeVisible();
-  await expect(page.getByText("Recursive force-delete.")).toBeVisible();
-  const approve = page.getByRole("button", { name: "Approve once" });
+  await expect(
+    page.getByText("Recursive force-delete — can wipe directories irrecoverably.", { exact: true }),
+  ).toBeVisible();
+  const toolCall = page.locator(".tool-call");
+  await expect(toolCall).toHaveAttribute("open", "");
+  const approve = toolCall.getByRole("button", { name: "Approve once" });
   await expect(approve).toBeVisible();
   await approve.focus();
   await approve.press("Enter");

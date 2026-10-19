@@ -1,40 +1,19 @@
 <script setup lang="ts">
-import { ref } from "vue";
 import { Activity, Braces, Check, GitFork, Info, Layers, Wrench } from "lucide-vue-next";
 import type { TranscriptItem, ToolCallView } from "@sdk/transcript";
 import { markdown } from "../client/markdown";
-import { agentHandle, attempt, json } from "../client/store";
+import { json } from "../client/store";
 import { runByCall, runById } from "../client/jobs";
-import { newId } from "../client/ids";
-import type { GuardApprovalState } from "../client/guard-approval";
+import type { GuardApprovalKey, GuardApprovalState } from "../client/guard-approval";
+import GuardApproval from "./guard-approval.vue";
 import JobCard from "./JobCard.vue";
 
-const props = defineProps<{ item: TranscriptItem; guardApproval?: GuardApprovalState }>();
+defineProps<{
+  item: TranscriptItem;
+  itemIndex: number;
+  guardApprovals: ReadonlyMap<GuardApprovalKey, GuardApprovalState>;
+}>();
 const emit = defineEmits<{ fork: [entryId: number] }>();
-const sendingApproval = ref(false);
-const approvalSent = ref(false);
-
-async function approveOnce() {
-  const approval = props.guardApproval;
-  const handle = agentHandle.value;
-  if (
-    !approval ||
-    approval.status !== "pending" ||
-    sendingApproval.value ||
-    approvalSent.value ||
-    !handle
-  )
-    return;
-
-  sendingApproval.value = true;
-  try {
-    approvalSent.value = Boolean(
-      await attempt(() => handle.send(`approve ${approval.request.hash}`, "followUp", newId())),
-    );
-  } finally {
-    sendingApproval.value = false;
-  }
-}
 const statusLabel = (call: ToolCallView) =>
   call.status === "error" ? "Error" : call.status === "done" ? "Done" : call.status;
 const entryClass = (item: TranscriptItem) =>
@@ -85,6 +64,7 @@ const entryClass = (item: TranscriptItem) =>
           class="tool-call"
           :class="{ failed: b.call.status === 'error' }"
           :data-call-id="b.call.callId"
+          :open="guardApprovals.has(b.call.callId)"
         >
           <summary>
             <Info v-if="b.call.status === 'error'" :size="18" />
@@ -115,17 +95,24 @@ const entryClass = (item: TranscriptItem) =>
             <div class="tool-section-label">Live output</div>
             <pre>{{ b.call.output }}</pre>
           </template>
+          <GuardApproval
+            v-if="guardApprovals.has(b.call.callId)"
+            :approval="guardApprovals.get(b.call.callId)!"
+          />
         </details>
         <JobCard
           v-if="b.type === 'tool' && b.call.name === 'run_durable_job' && runByCall(b.call.callId)"
           :run="runByCall(b.call.callId)!"
-        /></template
-      >
+      /></template>
       <div v-if="item.streaming && !item.blocks.length" class="typing"><i /><i /><i /></div>
       <div v-if="item.error" class="message-error">{{ item.error }}</div></template
     >
     <template v-else-if="item.kind === 'tool-result'"
-      ><details class="tool-result" :class="{ failed: item.isError }" :open="!!guardApproval">
+      ><details
+        class="tool-result"
+        :class="{ failed: item.isError }"
+        :open="guardApprovals.has(itemIndex)"
+      >
         <summary>
           <Check v-if="!item.isError" :size="18" /><Info v-else :size="18" /><strong>{{
             item.name
@@ -139,47 +126,10 @@ const entryClass = (item: TranscriptItem) =>
             <GitFork :size="18" />Fork
           </button>
         </summary>
-        <section
-          v-if="guardApproval"
-          class="guard-approval"
-          aria-label="Destructive command approval"
-        >
-          <div class="guard-approval-heading">
-            <Info :size="18" aria-hidden="true" />
-            <span>Destructive command blocked</span>
-          </div>
-          <code class="guard-approval-command">{{ guardApproval.request.label }}</code>
-          <p class="guard-approval-reason">{{ guardApproval.request.reason }}</p>
-          <div v-if="guardApproval.status === 'pending'" class="guard-approval-actions">
-            <button
-              class="guard-approval-button"
-              :disabled="sendingApproval || approvalSent || !agentHandle"
-              @click="approveOnce"
-            >
-              <Check v-if="approvalSent" :size="18" aria-hidden="true" />
-              {{
-                approvalSent
-                  ? "Approval sent"
-                  : sendingApproval
-                    ? "Sending approval…"
-                    : "Approve once"
-              }}
-            </button>
-            <span v-if="approvalSent" class="guard-approval-status" aria-live="polite">
-              Approval message sent to the root agent.
-            </span>
-          </div>
-          <p
-            v-else-if="guardApproval.status === 'sent'"
-            class="guard-approval-status"
-            aria-live="polite"
-          >
-            Approval message sent in this conversation.
-          </p>
-          <p v-else class="guard-approval-status">
-            A newer blocked attempt for this command replaces this request.
-          </p>
-        </section>
+        <GuardApproval
+          v-if="guardApprovals.has(itemIndex)"
+          :approval="guardApprovals.get(itemIndex)!"
+        />
         <pre v-else>{{ item.text }}</pre>
       </details></template
     >
@@ -189,7 +139,10 @@ const entryClass = (item: TranscriptItem) =>
         ><span>{{ item.call.status }}</span>
       </div>
       <pre v-if="item.call.output">{{ item.call.output }}</pre>
-      <JobCard v-if="item.call.name === 'run_durable_job' && runByCall(item.call.callId)" :run="runByCall(item.call.callId)!" />
+      <JobCard
+        v-if="item.call.name === 'run_durable_job' && runByCall(item.call.callId)"
+        :run="runByCall(item.call.callId)!"
+      />
     </div>
     <JobCard
       v-else-if="item.entryKind === 'demo.job' && runById((item.data as { taskId: number }).taskId)"

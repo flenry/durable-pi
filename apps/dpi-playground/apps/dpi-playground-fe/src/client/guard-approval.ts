@@ -15,6 +15,9 @@ export interface GuardApprovalState {
   status: GuardApprovalStatus;
 }
 
+/** Assistant tool calls use their callId; standalone tool-result items use their item index. */
+export type GuardApprovalKey = string | number;
+
 /** Read an actionable approval request only from a durable-guards block. */
 export function parseGuardBlockedResult(text: string): GuardApprovalRequest | undefined {
   const marker = text.indexOf(GUARD_BLOCKED_MARKER);
@@ -37,38 +40,48 @@ function parseApprovalMessage(text: string): string | undefined {
 }
 
 /**
- * Classify guard blocks in transcript order. A later block supersedes an older request for the same hash;
- * an exact approval message marks the latest matching request as sent and removes its button.
+ * Classify guard blocks in transcript order. Assistant tool blocks are keyed by callId, while
+ * standalone tool-result items use their transcript index. A newer block supersedes the older
+ * request for the same hash; an exact approval message marks the latest request as sent.
  */
 export function guardApprovalStates(
   items: readonly TranscriptItem[],
-): Map<number, GuardApprovalState> {
-  const states = new Map<number, GuardApprovalState>();
-  const latestByHash = new Map<string, number>();
+): Map<GuardApprovalKey, GuardApprovalState> {
+  const states = new Map<GuardApprovalKey, GuardApprovalState>();
+  const latestByHash = new Map<string, GuardApprovalKey>();
+
+  const addRequest = (key: GuardApprovalKey, text: string) => {
+    const request = parseGuardBlockedResult(text);
+    if (!request) return;
+
+    const previousKey = latestByHash.get(request.hash);
+    if (previousKey !== undefined) {
+      const previous = states.get(previousKey);
+      if (previous) states.set(previousKey, { ...previous, status: "superseded" });
+    }
+    states.set(key, { request, status: "pending" });
+    latestByHash.set(request.hash, key);
+  };
 
   items.forEach((item, index) => {
-    if (item.kind === "tool-result") {
-      const request = parseGuardBlockedResult(item.text);
-      if (!request) return;
-
-      const previousIndex = latestByHash.get(request.hash);
-      if (previousIndex !== undefined) {
-        const previous = states.get(previousIndex);
-        if (previous) states.set(previousIndex, { ...previous, status: "superseded" });
-      }
-      states.set(index, { request, status: "pending" });
-      latestByHash.set(request.hash, index);
+    if (item.kind === "user") {
+      const hash = parseApprovalMessage(item.text);
+      if (!hash) return;
+      const keyToResolve = latestByHash.get(hash);
+      if (keyToResolve === undefined) return;
+      const state = states.get(keyToResolve);
+      if (state?.status === "pending") states.set(keyToResolve, { ...state, status: "sent" });
       return;
     }
 
-    if (item.kind !== "user") return;
-    const hash = parseApprovalMessage(item.text);
-    if (!hash) return;
-    const indexToResolve = latestByHash.get(hash);
-    if (indexToResolve === undefined) return;
-    const state = states.get(indexToResolve);
-    if (state) states.set(indexToResolve, { ...state, status: "sent" });
-    latestByHash.delete(hash);
+    if (item.kind === "assistant") {
+      for (const block of item.blocks)
+        if (block.type === "tool" && typeof block.call.result === "string")
+          addRequest(block.call.callId, block.call.result);
+      return;
+    }
+
+    if (item.kind === "tool-result") addRequest(index, item.text);
   });
 
   return states;
