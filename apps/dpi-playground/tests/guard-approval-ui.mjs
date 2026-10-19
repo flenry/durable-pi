@@ -9,7 +9,7 @@ const root = resolve(import.meta.dirname, "../apps/dpi-playground-fe");
 const fixture = resolve(import.meta.dirname, "guard-approval.html");
 const transcriptFixture = resolve(
   import.meta.dirname,
-  "../../../docs/workers/polish/real-blocked-transcript.json",
+  "./fixtures/real-blocked-transcript.json",
 );
 const vite = await createServer({
   configFile: resolve(root, "vite.config.ts"),

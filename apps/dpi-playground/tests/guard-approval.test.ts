@@ -10,7 +10,7 @@ import {
 const hash = "a".repeat(64);
 const realTranscript = JSON.parse(
   readFileSync(
-    new URL("../../../docs/workers/polish/real-blocked-transcript.json", import.meta.url),
+    new URL("./fixtures/real-blocked-transcript.json", import.meta.url),
     "utf8",
   ),
 ) as { items: TranscriptItem[] };

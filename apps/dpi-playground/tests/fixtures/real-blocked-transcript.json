@@ -1,0 +1,43 @@
+{
+ "format": "json",
+ "items": [
+  {
+   "kind": "user",
+   "id": 10,
+   "text": "rm -rf scratch"
+  },
+  {
+   "kind": "assistant",
+   "id": 14,
+   "streaming": false,
+   "blocks": [
+    {
+     "type": "tool",
+     "call": {
+      "callId": "call_2904f8b2ca4f43ada923f995a44c22a8|fc_0af2e1b1a029211f016ad5c59f941881918ab57d454510d21a",
+      "name": "bash",
+      "args": {
+       "command": "rm -rf scratch"
+      },
+      "status": "error",
+      "result": "<harness>\n[error] Tool call blocked: DPI_GUARD_BLOCKED: Blocked destructive command (rm -rf): Recursive force-delete \u2014 can wipe directories irrecoverably. The user must reply exactly: approve 527e6747ce5a7156cea93abc30891efc199ee75b99fc2540bd86c7f341f3cb3c. Do not self-approve or change the command; then re-run it once. Unattended ticket workers must stop and report TICKET_STATUS: BLOCKED: command needs approval (rm -rf).\n</harness>",
+      "resultEntryId": 16
+     }
+    }
+   ],
+   "model": "gpt-6-luna"
+  },
+  {
+   "kind": "assistant",
+   "id": 18,
+   "streaming": false,
+   "blocks": [
+    {
+     "type": "text",
+     "text": "The deletion was blocked. To approve, reply exactly:\n\n`approve 527e6747ce5a7156cea93abc30891efc199ee75b99fc2540bd86c7f341f3cb3c`"
+    }
+   ],
+   "model": "gpt-6-luna"
+  }
+ ]
+}
