@@ -7,7 +7,15 @@ import { readdirSync, readFileSync, realpathSync, statSync, type Dirent } from "
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { OnboardOptions } from "./config.js";
 
-type EntryKind = "skill" | "prompt";
+export type SkillCatalogKind = "skill" | "prompt";
+
+type EntryKind = SkillCatalogKind;
+
+export interface SkillCatalogItem {
+  name: string;
+  description: string;
+  kind: SkillCatalogKind;
+}
 
 interface CatalogEntry {
   name: string;
@@ -390,16 +398,10 @@ function renderCatalog(options: Pick<OnboardOptions, "setupDir" | "skillsExclude
   return lines.join("\n");
 }
 
-function loadEntry(options: Pick<OnboardOptions, "setupDir" | "skillsExclude">, name: string): CatalogEntry & { content: string } {
-  if (
-    !name.trim() || name !== name.trim() || name === "." || name === ".." ||
-    name.includes("/") || name.includes("\\") || /[\0-\x1f]/.test(name)
-  ) {
-    throw new Error("name must be a catalog name without path separators or traversal");
-  }
-  const entry = scanCatalog(options).entries.find((candidate) => candidate.name === name);
-  if (!entry) throw new Error(`Unknown skill or prompt "${name}"`);
-
+function readCatalogEntry(
+  options: Pick<OnboardOptions, "setupDir" | "skillsExclude">,
+  entry: CatalogEntry,
+): CatalogEntry & { content: string } {
   // Re-check the canonical target immediately before reading it. Never trust a path built from
   // the tool argument; names are lookup keys only and the target comes from the scanned catalog.
   const rootPath = resolve(options.setupDir, "agent", entry.kind === "skill" ? "skills" : "prompts");
@@ -415,6 +417,40 @@ function loadEntry(options: Pick<OnboardOptions, "setupDir" | "skillsExclude">, 
   const sourceDirectory = dirname(sourcePath);
   const content = readFileSync(sourcePath, "utf8");
   return { ...entry, sourcePath, sourceDirectory, content };
+}
+
+function loadEntry(options: Pick<OnboardOptions, "setupDir" | "skillsExclude">, name: string): CatalogEntry & { content: string } {
+  if (
+    !name.trim() || name !== name.trim() || name === "." || name === ".." ||
+    name.includes("/") || name.includes("\\") || /[\0-\x1f]/.test(name)
+  ) {
+    throw new Error("name must be a catalog name without path separators or traversal");
+  }
+  const entry = scanCatalog(options).entries.find((candidate) => candidate.name === name);
+  if (!entry) throw new Error(`Unknown skill or prompt "${name}"`);
+  return readCatalogEntry(options, entry);
+}
+
+/** Public view of the configured skill and prompt catalog; source paths stay host-side. */
+export function listSkillCatalog(
+  options: Pick<OnboardOptions, "setupDir" | "skillsExclude">,
+): SkillCatalogItem[] {
+  return scanCatalog(options).entries.map(({ name, description, kind }) => ({ name, description, kind }));
+}
+
+/** Expand a leading slash command through the same verified loader used by load_skill. */
+export function expandSkillCommand(
+  options: Pick<OnboardOptions, "setupDir" | "skillsExclude">,
+  content: string,
+): string {
+  const command = /^\/(?:skill:)?([^\s]+)(?:\s+([\s\S]*))?$/.exec(content);
+  if (!command) return content;
+  const [, name, rawArgs] = command;
+  const entry = scanCatalog(options).entries.find((candidate) => candidate.name === name);
+  if (!entry) return content;
+  const loaded = readCatalogEntry(options, entry);
+  const args = rawArgs?.trim();
+  return `${loadedText(loaded, loaded.content)}${args ? `\n\nUser request: ${args}` : ""}`;
 }
 
 function loadedText(entry: CatalogEntry, content: string): string {

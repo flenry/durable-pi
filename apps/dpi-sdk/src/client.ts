@@ -15,6 +15,7 @@ import type {
   Page,
   SendResult,
   SessionSummary,
+  SkillCatalogEntry,
   TaskOutcome,
   WhenBusy,
   WireEntry,
@@ -124,6 +125,9 @@ export class DpiClient {
   // ------------------------------------------------------------ device
   device(options?: RequestOptions) {
     return this.request<DeviceInfo>("GET", "/v1/device", undefined, options);
+  }
+  skills(options?: RequestOptions) {
+    return this.request<SkillCatalogEntry[]>("GET", "/v1/skills", undefined, options);
   }
   tree() {
     return this.request<DeviceTree>("GET", "/v1/tree");

@@ -17,6 +17,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 |---|---|---|
 | `GET /healthz` | (no auth) | `{ok:true}` |
 | `GET /v1/device` | | `DeviceInfo`: uid, name, hostname, platform, `apiVersion`, `durableVersion`, `startedAt`, models, `defaultModel`, `startDirs`, storage, `codeDir` (the checkout it runs from), capabilities, `jobs` (durable job definitions) |
+| `GET /v1/skills` | | `SkillCatalogEntry[]`: `{name, description, kind: "skill"|"prompt"}` from the device's configured catalog; empty when onboarding is disabled. Requires device auth |
 | `GET /v1/tree` | | `DeviceTree`: sessions with agents and busy/background |
 | `GET /v1/events` | `?docs=app.shared-state` | device stream |
 | `GET /v1/fs/dirs` | `?path=` (empty = start dirs) | `{path, parent, dirs[]}`, one level, directories only |
@@ -35,7 +36,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 | `GET .../agents/:a/events` | `?docs=demo.job-runs` | agent stream |
 | `GET .../agents/:a/entries` | `?scope=all\|active&cursor=&limit=` | `{items, next}` stored history; `limit` defaults to 500 (max 2000). `scope=active` returns `{items}`, the active context, unpaged |
 | `GET .../agents/:a/transcript` | `?format=json\|markdown` | normalized transcript |
-| `POST .../agents/:a/messages` | `{content, whenBusy?: followUp\|steer\|reject, requestId, waitMs?}` (`whenBusy` defaults to `followUp`; `waitMs` ≤300000) | `202 {submissionId, status:"queued"\|"pending"}`, `200 {status:"done", answer:{entryId,text}}` or `200 {status:"unanswered", reason}` |
+| `POST .../agents/:a/messages` | `{content, whenBusy?: followUp\|steer\|reject, requestId, waitMs?}` (`whenBusy` defaults to `followUp`; `waitMs` ≤300000) | `202 {submissionId, status:"queued"\|"pending"}`, `200 {status:"done", answer:{entryId,text}}` or `200 {status:"unanswered", reason}`. Authenticated human messages beginning `/name` or `/skill:name` expand a matching `GET /v1/skills` entry before submission; unknown commands pass through unchanged. Internal sends are not expanded |
 | `DELETE .../agents/:a/inbox/:submissionId` | | withdraw a queued input |
 | `POST .../agents/:a/abort` | `{background?}` | stops foreground work (and background with `true`) |
 | `POST .../agents/:a/fork` | `{entryId, name?}` | `201 AgentSummary` |

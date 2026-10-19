@@ -50,6 +50,7 @@ export function v1(store: Store) {
 
   // ---------------------------------------------------------- device
   r.get("/device", (_req, res) => res.json(store.deviceInfo()));
+  r.get("/skills", (_req, res) => res.json(store.skillsCatalog()));
   r.get("/tree", route(async (_req, res) => res.json(await store.tree())));
   r.get("/events", (req, res, next) => {
     try {

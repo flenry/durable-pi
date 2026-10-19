@@ -81,6 +81,15 @@ export interface DirListing {
   dirs: { name: string; path: string }[];
 }
 
+export type SkillCatalogKind = "skill" | "prompt";
+
+/** One entry available to slash-command expansion on an onboard-enabled device. */
+export interface SkillCatalogEntry {
+  name: string;
+  description: string;
+  kind: SkillCatalogKind;
+}
+
 // ---------------------------------------------------------------- sessions and agents
 
 export type AgentKind = "root" | "fork" | "subagent";

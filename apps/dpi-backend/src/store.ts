@@ -73,6 +73,7 @@ import { createJobs, JobRuns, JOB_DEFS, jobDef, resolveJobInput, type Jobs } fro
 import { ADDON_INFO, createAddons, PROMPTS, PromptChecklist, type Addons } from "./addons.js";
 import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
 import { onboardEnabledFromEnv, onboardOptionsFromEnv, type OnboardOptions } from "./onboard/config.js";
+import { expandSkillCommand, listSkillCatalog, type SkillCatalogItem } from "./onboard/skills.js";
 import { installOnboard } from "./onboard/index.js";
 import { ExpertIdentity } from "./onboard/experts.js";
 import { commandApprovalFromUserMessage, createGuardApprovalHost, createGuardsExtension, type GuardApprovalHost } from "./onboard/guards.js";
@@ -379,6 +380,10 @@ export class Store {
       capabilities: ["events", "docs", "demo", "jobs"],
       jobs: JOB_DEFS,
     };
+  }
+
+  skillsCatalog(): SkillCatalogItem[] {
+    return this.onboardOptions ? listSkillCatalog(this.onboardOptions) : [];
   }
 
   private defaultModel() {
@@ -1196,7 +1201,10 @@ export class Store {
     const key = this.submissionKey(row.id, c.id, input.requestId);
     return this.serializeSubmission(key, async () => {
       const existing = await h.commit((tx) => tx.submissionByRequest(c.id, input.requestId), ctx);
-      const submission = await c.submit({ type: "input", ...input }, ctx);
+      const content = existing || approvalHash || !this.onboardOptions
+        ? input.content
+        : expandSkillCommand(this.onboardOptions, input.content);
+      const submission = await c.submit({ type: "input", ...input, content }, ctx);
       if (!existing && approvalHash) this.opened.get(row.id)?.guardApprovals?.approve(approvalHash, c.id);
       return submission;
     });
