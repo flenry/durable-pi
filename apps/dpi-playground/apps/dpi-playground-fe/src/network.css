@@ -644,13 +644,14 @@
   border-radius: 10px;
   box-shadow: 0 20px 60px #0007;
   z-index: 20;
-  max-height: 320px;
+  max-height: min(320px, 50vh);
   overflow-y: auto;
 }
 .slash-menu li {
   display: flex;
   align-items: baseline;
-  gap: 10px;
+  gap: 8px;
+  min-width: 0;
   padding: 7px 10px;
   border-radius: 6px;
   cursor: pointer;
@@ -659,17 +660,40 @@
   background: #ff899714;
 }
 .slash-menu code {
+  flex: 0 0 auto;
   color: var(--accent);
   font-size: 15px;
 }
 .slash-args {
+  flex: 0 0 auto;
   color: var(--muted);
   font-family: "IBM Plex Mono", monospace;
   font-size: 14px;
 }
+.slash-kind {
+  flex: 0 0 auto;
+  border: 1px solid #ffffff1a;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 0 6px;
+  text-transform: uppercase;
+}
+.slash-kind.kind-skill {
+  color: var(--accent);
+}
+.slash-kind.kind-prompt {
+  color: #c9b2ff;
+}
 .slash-desc {
+  flex: 1 1 auto;
+  min-width: 0;
   margin-left: auto;
   color: var(--muted);
   font-size: 14px;
+  overflow: hidden;
   text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

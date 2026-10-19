@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Skill picker component test</title>
+    <link rel="stylesheet" href="/src/style.css" />
+    <link rel="stylesheet" href="/src/network.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      import { createApp } from "vue";
+      import Composer from "/src/components/Composer.vue";
+      import { network, selected, ui } from "/src/client/store";
+
+      network.model.apply({
+        type: "network",
+        devices: [
+          {
+            id: "local",
+            name: "Local",
+            kind: "local",
+            url: "http://127.0.0.1:43123",
+            source: "config",
+            hasToken: true,
+            status: "online",
+          },
+        ],
+      });
+      selected.value = { deviceId: "local", sessionId: "skill-test", agentId: 1 };
+      window.__skillPickerState = { ui };
+      createApp(Composer).mount("#app");
+    </script>
+  </body>
+</html>

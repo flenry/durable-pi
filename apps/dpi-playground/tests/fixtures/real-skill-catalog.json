@@ -1,0 +1,22 @@
+[
+  {
+    "name": "brainstorm",
+    "description": "You are brainstorming an idea with the user. Divergent, cheap, low-stakes. Narrow toward a scope we can grill.",
+    "kind": "prompt"
+  },
+  {
+    "name": "code-review",
+    "description": "Two-axis review of the diff since a fixed point — Spec (does the diff implement the PRD?) and Design+Smells (Ousterhut design checks Fowler can't express, then the Fowler smell baseline). Runs on GLM; escalate flagged hunks to Opus via Ctrl+L. Use when the user wants to review a branch, a PR, or work-in-progress changes, or asks to \"review since X\".",
+    "kind": "skill"
+  },
+  {
+    "name": "frontend-design",
+    "description": "Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when the user asks to build web components, pages, or applications. Generates creative, polished code that avoids generic AI aesthetics.",
+    "kind": "skill"
+  },
+  {
+    "name": "grill",
+    "description": "A relentless one-question-at-a-time design interview that produces a PRD, a CONTEXT.md glossary, and ADRs with rationale. Use when the user wants to stress-test a plan or idea before any code is written, or says \"grill me\", \"stress-test this plan\", \"interrogate this design\". Drives the deep-module vocabulary from Ousterhout.",
+    "kind": "skill"
+  }
+]

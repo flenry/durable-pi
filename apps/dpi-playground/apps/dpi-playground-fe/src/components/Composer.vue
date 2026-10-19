@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { ArrowUp, ChevronDown, Clock3, Octagon, X } from "lucide-vue-next";
-import type { WhenBusy } from "@sdk/api";
+import type { SkillCatalogEntry, WhenBusy } from "@sdk/api";
 import { newId } from "../client/ids";
-import { commands, parseCommand, type SlashCommand } from "../client/commands";
+import { commands, parseCommand } from "../client/commands";
+import { getSkillCatalogForDevice } from "../client/skill-catalog";
+import { filterSlashMenu, mergeSlashMenu, type SlashMenuItem } from "../client/slash-menu";
 import {
   agentHandle,
   agentState,
   attempt,
   busy,
+  client,
+  deviceId,
   interrupt,
   interrupting,
   online,
@@ -18,16 +22,39 @@ import {
 
 const mode = ref<WhenBusy>("followUp");
 const pending = ref(false);
+const skillCatalog = ref<SkillCatalogEntry[]>([]);
+const composerInput = ref<HTMLTextAreaElement>();
 
-// Typing "/" lists the slash commands; arrows pick, Tab or Enter completes.
+watch(
+  [deviceId, client, online],
+  ([id, deviceClient, isOnline], _previous, onCleanup) => {
+    skillCatalog.value = [];
+    if (!id || !deviceClient || !isOnline) return;
+    let current = true;
+    onCleanup(() => (current = false));
+    void getSkillCatalogForDevice(id, () => deviceClient.skills()).then(
+      (catalog) => {
+        if (current) skillCatalog.value = catalog;
+      },
+      () => {
+        if (current) skillCatalog.value = [];
+      },
+    );
+  },
+  { immediate: true },
+);
+
+// Typing "/" lists built-in commands and the selected device's catalog.
 const menuIndex = ref(0);
 const menuClosed = ref(false);
-const matches = computed(() => {
-  const m = ui.composer.match(/^\/(\S*)$/);
-  return m && !menuClosed.value
-    ? commands.filter((c) => c.name.startsWith(m[1].toLowerCase()))
-    : [];
+const menuQuery = computed(() => {
+  const match = ui.composer.match(/^\/(\S*)$/);
+  return match && !menuClosed.value ? match[1] : undefined;
 });
+const menuItems = computed(() => mergeSlashMenu(commands, skillCatalog.value));
+const matches = computed(() =>
+  menuQuery.value === undefined ? [] : filterSlashMenu(menuItems.value, menuQuery.value),
+);
 watch(
   () => ui.composer,
   () => {
@@ -35,8 +62,27 @@ watch(
     if (!ui.composer.startsWith("/")) menuClosed.value = false;
   },
 );
-// Enter on a fully typed name runs it unless it needs an argument; otherwise the name completes.
-async function pick(command: SlashCommand, enter = false) {
+watch(skillCatalog, () => (menuIndex.value = 0));
+
+function completeSkill(name: string) {
+  const value = `/${name} `;
+  ui.composer = value;
+  void nextTick(() => {
+    const textarea = composerInput.value;
+    if (!textarea) return;
+    textarea.focus();
+    textarea.setSelectionRange(value.length, value.length);
+  });
+}
+
+// Enter keeps built-ins' existing behavior; skills/prompts complete so the user can add arguments.
+async function pick(item: SlashMenuItem, enter = false) {
+  if (item.kind !== "command") {
+    completeSkill(item.name);
+    return;
+  }
+  const command = commands.find((candidate) => candidate.name === item.name);
+  if (!command) return;
   const runNow =
     !command.args || (enter && command.args.startsWith("[") && ui.composer === `/${command.name}`);
   if (!runNow) ui.composer = `/${command.name} `;
@@ -56,9 +102,10 @@ function keydown(e: KeyboardEvent) {
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
     const n = matches.value.length;
     menuIndex.value = (menuIndex.value + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
-  } else if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))
-    void pick(matches.value[menuIndex.value], e.key === "Enter");
-  else if (e.key === "Escape") menuClosed.value = true;
+  } else if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+    const item = matches.value[menuIndex.value];
+    if (item) void pick(item, e.key === "Enter");
+  } else if (e.key === "Escape") menuClosed.value = true;
   else return;
   e.preventDefault();
   e.stopPropagation();
@@ -128,10 +175,17 @@ function withdraw(id: number) {
       </div>
     </div>
     <div class="composer">
-      <ul v-if="matches.length" class="slash-menu" role="listbox" aria-label="Slash commands">
+      <ul
+        v-if="matches.length"
+        id="slash-menu"
+        class="slash-menu"
+        role="listbox"
+        aria-label="Slash commands"
+      >
         <li
           v-for="(c, i) in matches"
-          :key="c.name"
+          :id="`slash-option-${i}`"
+          :key="`${c.kind}/${c.name}`"
           role="option"
           :aria-selected="i === menuIndex"
           :class="{ active: i === menuIndex }"
@@ -139,14 +193,19 @@ function withdraw(id: number) {
         >
           <code>/{{ c.name }}</code
           ><span v-if="c.args" class="slash-args">{{ c.args }}</span
+          ><span class="slash-kind" :class="`kind-${c.kind}`">{{ c.kind }}</span
           ><span class="slash-desc">{{ c.description }}</span>
         </li>
       </ul>
       <textarea
+        ref="composerInput"
         v-model="ui.composer"
         rows="2"
         placeholder="Give your agent something to do, or type / for commands…"
         aria-label="Message your agent"
+        aria-controls="slash-menu"
+        :aria-expanded="matches.length > 0"
+        :aria-activedescendant="matches.length ? `slash-option-${menuIndex}` : undefined"
         @keydown="keydown"
       />
       <div class="composer-toolbar">
