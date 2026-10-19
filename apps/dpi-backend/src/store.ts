@@ -31,9 +31,9 @@ import {
 import { lastAssistantText, messageText, toMarkdown, toTranscript } from "../../dpi-sdk/src/transcript.js";
 import { ApiFault, invalid, notFound } from "./errors.js";
 import { DatabaseSync } from "node:sqlite";
-import { mkdir, readdir, realpath, rename as renamePath, stat } from "node:fs/promises";
+import { lstat, mkdir, readdir, realpath, rename as renamePath, stat } from "node:fs/promises";
 import { mkdirSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { homedir, hostname, platform } from "node:os";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
@@ -174,6 +174,14 @@ function legacyReadOnlySelection(tools: AgentState["tools"], legacyWriters: stri
     legacyWriters.length > 0 &&
     legacyWriters.every((name) => tools.remove.includes(name))
   );
+}
+
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function assertWithinDirectory(root: string, path: string) {
+  const fromRoot = relative(root, path);
+  if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot))
+    throw new Error("Session database path escapes the data directory");
 }
 
 export type SessionRow = {
@@ -483,24 +491,34 @@ export class Store {
 
   // ------------------------------------------------------------ sessions
 
+  private sessionDbPath(id: string) {
+    if (typeof id !== "string" || !SESSION_ID_PATTERN.test(id)) throw new Error("Invalid session id");
+    return join(this.sessionsDir, id, "agent.sqlite");
+  }
+
+  private sessionRow(row: SessionRow): SessionRow {
+    return { ...row, dbPath: this.sessionDbPath(row.id) };
+  }
+
   list(): SessionRow[] {
-    return this.catalog.prepare("SELECT * FROM sessions ORDER BY createdAt DESC").all() as SessionRow[];
+    return (this.catalog.prepare("SELECT * FROM sessions ORDER BY createdAt DESC").all() as SessionRow[])
+      .map((row) => this.sessionRow(row));
   }
 
   row(id: string): SessionRow {
     const row = this.catalog.prepare("SELECT * FROM sessions WHERE id=?").get(id) as SessionRow | undefined;
     if (!row) throw notFound(`No session ${id}`);
-    return row;
+    return this.sessionRow(row);
   }
 
   /** A session by UUID or unique case-insensitive name. */
   resolveSession(ref: string): SessionRow {
     const byId = this.catalog.prepare("SELECT * FROM sessions WHERE id=?").get(ref) as SessionRow | undefined;
-    if (byId) return byId;
+    if (byId) return this.sessionRow(byId);
     const matches = this.catalog
       .prepare("SELECT * FROM sessions WHERE lower(name)=lower(?)")
       .all(ref) as SessionRow[];
-    if (matches.length === 1) return matches[0];
+    if (matches.length === 1) return this.sessionRow(matches[0]);
     if (matches.length > 1)
       throw new ApiFault("ambiguous", `${matches.length} sessions are named "${ref}"; use the session id`);
     throw notFound(`No session "${ref}" on ${this.name}`);
@@ -533,7 +551,7 @@ export class Store {
       id,
       name: body.name.trim().slice(0, 100) || "Untitled session",
       cwd,
-      dbPath: join(this.sessionsDir, id, "agent.sqlite"),
+      dbPath: this.sessionDbPath(id),
       createdAt: Date.now(),
       model: model.modelId,
       provider: model.provider,
@@ -585,6 +603,7 @@ export class Store {
 
   /** Stop all work, close the harness and move its files to archive/. Nothing is deleted. */
   async archive(row: SessionRow) {
+    row = this.sessionRow(row);
     const opened = this.opened.get(row.id);
     if (opened) {
       for (const record of await this.scanAll(opened.harness)) {
@@ -614,12 +633,63 @@ export class Store {
     return { archived: target };
   }
 
+  private async openSessionDbPath(id: string, create: boolean) {
+    this.sessionDbPath(id);
+    const dataRoot = await realpath(this.options.dataDir);
+    try {
+      const sessionsInfo = await lstat(this.sessionsDir);
+      if (!sessionsInfo.isDirectory() && !sessionsInfo.isSymbolicLink())
+        throw new Error("Sessions path must be a directory inside the data directory");
+    } catch (error) {
+      if (!create || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await mkdir(this.sessionsDir, { recursive: true });
+    }
+    const sessionsRoot = await realpath(this.sessionsDir);
+    assertWithinDirectory(dataRoot, sessionsRoot);
+
+    const sessionDir = join(sessionsRoot, id);
+    if (create) {
+      try {
+        await lstat(sessionDir);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await mkdir(sessionDir, { recursive: true });
+      }
+    }
+    const sessionDirInfo = await lstat(sessionDir);
+    if (sessionDirInfo.isSymbolicLink() || !sessionDirInfo.isDirectory())
+      throw new Error("Session directory must be a directory inside the data directory");
+    const realSessionDir = await realpath(sessionDir);
+    assertWithinDirectory(dataRoot, realSessionDir);
+    const dbPath = join(realSessionDir, "agent.sqlite");
+
+    const checkFile = async (path: string) => {
+      let info;
+      try {
+        info = await lstat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      if (info.isSymbolicLink()) throw new Error("Session database files must not be symbolic links");
+      assertWithinDirectory(dataRoot, await realpath(path));
+      return true;
+    };
+
+    const exists = await checkFile(dbPath);
+    if (!create && !exists) await stat(dbPath);
+    for (const suffix of ["-wal", "-shm", "-journal", ".lock"]) await checkFile(`${dbPath}${suffix}`);
+    // Keep the computed path tied to this Store, never to the catalog's historical absolute dbPath.
+    assertWithinDirectory(dataRoot, dbPath);
+    return dbPath;
+  }
+
   async openAgent(row: SessionRow, create = false, thinkingLevel: ThinkingLevel = "low") {
+    row = this.sessionRow(row);
     const current = this.opened.get(row.id);
     if (current) return current.harness;
-    if (!create) await stat(row.dbPath);
-    await mkdir(dirname(row.dbPath), { recursive: true });
-    const unlock = lockFile(`${row.dbPath}.lock`);
+    const dbPath = await this.openSessionDbPath(row.id, create);
+    const unlock = lockFile(`${dbPath}.lock`);
     try {
       const shellEnv = Object.fromEntries(
         ["PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "TERM"].flatMap((k) =>
@@ -651,7 +721,7 @@ export class Store {
         .find((extension) => extension.name === "tickets")
         ?.tasks?.find((task) => task.definition.name === TICKET_SCHEDULER_TASK_NAME);
       const harness = await Harness.open(
-        await openNodeSqliteStorage(row.dbPath),
+        await openNodeSqliteStorage(dbPath),
         {
           models: this.models,
           registry,
@@ -1401,6 +1471,7 @@ export class Store {
   // ------------------------------------------------------------ tree
 
   sessionSummaryBase(row: SessionRow) {
+    row = this.sessionRow(row);
     return {
       id: row.id,
       name: row.name,

@@ -2,9 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
-import type { Store } from "../src/store.js";
+import { Store } from "../src/store.js";
 import { JOB_RUNS_DOC, type JobRunsDoc } from "../../dpi-sdk/src/jobs.js";
 import { faux, tempStore, until } from "./helpers.js";
 
@@ -184,6 +184,54 @@ test("submission admissions in separate sessions do not share a lock", async () 
     await trySubmission("authenticated", (row, c, body) => store.submitAuthenticatedUserMessage(row, c, body));
   } finally {
     await store.close();
+    await t.cleanup();
+  }
+});
+
+test("restored stores open session databases from their current data directory", async () => {
+  const t = await tempStore();
+  let source: Store | undefined = await t.open();
+  let restored: Store | undefined;
+  try {
+    const session = await source.create({ name: "Backup source", cwd: t.work, model: faux });
+    const { h, c } = await source.resolveAgent(session.id, "main");
+    const submission = await source.send(session.id, c, { content: "persist before backup", requestId: "backup-source" });
+    assert.equal((await source.settled(h, submission.id as number, 15_000)).status, "done");
+    await source.close();
+    source = undefined;
+
+    const restoredDir = join(t.root, "restored-data");
+    await cp(t.options.dataDir, restoredDir, { recursive: true });
+    const sourceSessionDir = join(t.options.dataDir, "sessions", session.id);
+    const snapshot = async () =>
+      Promise.all((await readdir(sourceSessionDir)).sort().map(async (name) => {
+        const path = join(sourceSessionDir, name);
+        const [info, data] = await Promise.all([stat(path), readFile(path)]);
+        return { name, size: info.size, mtimeMs: info.mtimeMs, data: data.toString("base64") };
+      }));
+    const before = await snapshot();
+
+    restored = await Store.open({ ...t.options, dataDir: restoredDir });
+    const restoredRow = restored.row(session.id);
+    const expectedDbPath = join(restoredDir, "sessions", session.id, "agent.sqlite");
+    assert.equal(restoredRow.dbPath, expectedDbPath);
+    assert.equal(restored.list()[0].dbPath, expectedDbPath);
+    assert.equal(restored.resolveSession(session.name).dbPath, expectedDbPath);
+    assert.equal(restored.errors.has(session.id), false, "the restored session opens successfully");
+    const restoredAgent = await restored.resolveAgent(session.id, "main");
+    assert.match(await restored.preview(restoredRow, 1) ?? "", /persist before backup/);
+    const restoredSubmission = await restored.send(session.id, restoredAgent.c, {
+      content: "write only in the restored copy",
+      requestId: "backup-restored-write",
+    });
+    assert.equal((await restored.settled(restoredAgent.h, restoredSubmission.id as number, 15_000)).status, "done");
+    await restored.close();
+    restored = undefined;
+
+    assert.deepEqual(await snapshot(), before, "opening and writing the restored session leaves the source untouched");
+  } finally {
+    await restored?.close();
+    await source?.close();
     await t.cleanup();
   }
 });
