@@ -2,7 +2,9 @@ import type {
   AgentConfig,
   AgentDetail,
   AgentExtensions,
+  AgentListOptions,
   AgentSummary,
+  CloseAgentBody,
   CompactionSettings,
   CreateAgentBody,
   CreateSessionBody,
@@ -129,8 +131,8 @@ export class DpiClient {
   skills(options?: RequestOptions) {
     return this.request<SkillCatalogEntry[]>("GET", "/v1/skills", undefined, options);
   }
-  tree() {
-    return this.request<DeviceTree>("GET", "/v1/tree");
+  tree(options: AgentListOptions = {}) {
+    return this.request<DeviceTree>("GET", `/v1/tree${options.closed ? "?closed=1" : ""}`);
   }
   dirs(path = "") {
     return this.request<DirListing>("GET", `/v1/fs/dirs?path=${enc(path)}`);
@@ -143,8 +145,8 @@ export class DpiClient {
   }
 
   // ------------------------------------------------------------ sessions
-  sessions() {
-    return this.request<SessionSummary[]>("GET", "/v1/sessions");
+  sessions(options: AgentListOptions = {}) {
+    return this.request<SessionSummary[]>("GET", `/v1/sessions${options.closed ? "?closed=1" : ""}`);
   }
   createSession(body: CreateSessionBody, idempotencyKey = newId()) {
     return this.request<SessionSummary>("POST", "/v1/sessions", body, { idempotencyKey });
@@ -165,8 +167,8 @@ export class SessionHandle {
   get base() {
     return `/v1/sessions/${enc(this.ref)}`;
   }
-  get() {
-    return this.client.request<SessionSummary>("GET", this.base);
+  get(options: AgentListOptions = {}) {
+    return this.client.request<SessionSummary>("GET", `${this.base}${options.closed ? "?closed=1" : ""}`);
   }
   rename(name: string) {
     return this.client.request<SessionSummary>("PATCH", this.base, { name });
@@ -174,8 +176,8 @@ export class SessionHandle {
   archive() {
     return this.client.request<{ archived: string }>("DELETE", this.base);
   }
-  agents() {
-    return this.client.request<AgentSummary[]>("GET", `${this.base}/agents`);
+  agents(options: AgentListOptions = {}) {
+    return this.client.request<AgentSummary[]>("GET", `${this.base}/agents${options.closed ? "?closed=1" : ""}`);
   }
   createAgent(body: CreateAgentBody = {}, idempotencyKey = newId()) {
     return this.client.request<AgentSummary>("POST", `${this.base}/agents`, body, { idempotencyKey });
@@ -220,6 +222,9 @@ export class AgentHandle {
   }
   rename(name: string) {
     return this.client.request<AgentSummary>("PATCH", this.base, { name });
+  }
+  setClosed(closed: boolean, options: Omit<CloseAgentBody, "closed"> = {}) {
+    return this.client.request<AgentSummary>("PATCH", this.base, { closed, ...options } satisfies CloseAgentBody);
   }
   send(content: string, whenBusy: WhenBusy = "followUp", requestId = newId(), waitMs?: number) {
     return this.client.request<SendResult>(

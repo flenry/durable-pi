@@ -133,6 +133,16 @@ const ReadOnlyPolicy = defineDoc<ReadOnlyPolicyState>({
   checkpointWhen: () => true,
 });
 
+type AgentCloseState = { closed: boolean };
+const AgentClose = defineDoc<AgentCloseState>({
+  kind: "dpi.store-agent-close",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ closed: false }),
+});
+
 type GuardSelectionState = { migrationVersion: number; optedOut: boolean };
 const GUARD_SELECTION_MIGRATION_VERSION = 1;
 const GuardSelectionPolicy = defineDoc<GuardSelectionState>({
@@ -868,19 +878,39 @@ export class Store {
     };
   }
 
-  async agents(row: SessionRow, tasks?: TaskNode[]): Promise<AgentSummary[]> {
+  private visibleAgents(agents: AgentSummary[], includeClosed: boolean): AgentSummary[] {
+    if (includeClosed) return agents;
+    const hidden = new Set(agents.filter((agent) => agent.closed).map((agent) => agent.id));
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const agent of agents) {
+        const parent = agent.parentId ?? agent.ownerAgentId;
+        if (parent !== undefined && hidden.has(parent) && !hidden.has(agent.id)) {
+          hidden.add(agent.id);
+          changed = true;
+        }
+      }
+    }
+    return agents.filter((agent) => !hidden.has(agent.id));
+  }
+
+  async agents(row: SessionRow, tasks?: TaskNode[], includeClosed = false): Promise<AgentSummary[]> {
     const h = this.harness(row);
     const names = this.names(row.id);
     const records = await this.scanAll(h);
     const live = tasks ?? (await this.liveTasks(h));
-    return records.map((record) => {
+    const closeStates = await Promise.all(records.map((record) => h.snapshot(AgentClose, record.id, ctx)));
+    const agents = records.map((record, index) => {
       const own = live.filter((t) => t.conversationId === (record.id as number));
       return {
         ...this.agentRef(record, names),
         busy: own.some((t) => !t.background),
         background: own.filter((t) => t.background).length,
+        closed: closeStates[index]?.closed ?? false,
       };
     });
+    return this.visibleAgents(agents, includeClosed);
   }
 
   async liveTasks(h: Harness): Promise<TaskNode[]> {
@@ -942,7 +972,7 @@ export class Store {
   }
 
   async agentSummary(row: SessionRow, c: Conversation): Promise<AgentSummary> {
-    const agents = await this.agents(row);
+    const agents = await this.agents(row, undefined, true);
     return agents.find((a) => a.id === (c.id as number))!;
   }
 
@@ -1089,17 +1119,82 @@ export class Store {
     };
   }
 
-  setAgentName(row: SessionRow, agentId: number, name: unknown) {
+  private validateAgentName(agentId: number, name: unknown): string {
     if (typeof name !== "string" || !name.trim()) throw invalid("A name is required");
     const clean = name.trim().slice(0, 100);
     if (/^\d+$/.test(clean) || clean.toLowerCase() === "main" && agentId !== 1)
       throw invalid("Agent names cannot be numbers or 'main'");
+    return clean;
+  }
+
+  setAgentName(row: SessionRow, agentId: number, name: unknown) {
+    const clean = this.validateAgentName(agentId, name);
     this.catalog
       .prepare(
         "INSERT INTO conversation_names VALUES(?,?,?) ON CONFLICT(sessionId,conversationId) DO UPDATE SET name=excluded.name",
       )
       .run(row.id, agentId, clean);
     this.notify();
+  }
+
+  private ownedConversationIds(records: ConversationRecord[], rootId: number): Set<number> {
+    const ids = new Set([rootId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const record of records) {
+        const id = record.id as number;
+        const ownerId = record.owner?.conversationId as number | undefined;
+        if (ownerId !== undefined && ids.has(ownerId) && !ids.has(id)) {
+          ids.add(id);
+          changed = true;
+        }
+      }
+    }
+    return ids;
+  }
+
+  async setAgentClosed(row: SessionRow, c: Conversation, closed: unknown, abort?: unknown) {
+    if (typeof closed !== "boolean") throw invalid("closed must be a boolean");
+    if (abort !== undefined && typeof abort !== "boolean") throw invalid("abort must be a boolean");
+    if (!closed && abort === true) throw invalid("abort can only be used when closing an agent");
+    if (closed && c.id === ROOT_CONVERSATION_ID) throw invalid("The root conversation cannot be closed");
+
+    const h = this.harness(row);
+    if (closed) {
+      const records = await this.scanAll(h);
+      const subtree = this.ownedConversationIds(records, c.id as number);
+      const live = await this.liveTasks(h);
+      const active = live.filter((task) => subtree.has(task.conversationId));
+      if (active.length && abort !== true)
+        throw new ApiFault("busy", `Agent ${c.id} has active work; pass { closed: true, abort: true } to stop it before closing`);
+      if (abort === true) {
+        const ids = [c.id as number, ...[...subtree].filter((id) => id !== (c.id as number)).reverse()];
+        for (const id of ids) {
+          const conversation = id === (c.id as number) ? c : await h.conversation(id as ConversationId, ctx);
+          if (conversation) await conversation.abort(ctx, { background: true });
+        }
+      }
+    }
+
+    await c.commit(async (tx) => {
+      const state = await tx.doc(AgentClose, c.id);
+      state.closed = closed;
+    }, ctx);
+    this.notify();
+  }
+
+  async patchAgent(row: SessionRow, c: Conversation, body: Record<string, unknown>): Promise<AgentSummary> {
+    const name = body.name === undefined ? undefined : this.validateAgentName(c.id as number, body.name);
+    if (body.closed === undefined) {
+      if (body.abort !== undefined) throw invalid("abort requires closed:true");
+      if (name === undefined) throw invalid("A name or closed value is required");
+      this.setAgentName(row, c.id as number, name);
+    } else {
+      await this.setAgentClosed(row, c, body.closed, body.abort);
+      if (name !== undefined) this.setAgentName(row, c.id as number, name);
+    }
+    return this.agentSummary(row, c);
   }
 
   async createAgent(row: SessionRow, body: { from?: unknown; name?: unknown }) {
@@ -1491,15 +1586,19 @@ export class Store {
     };
   }
 
-  async sessionSummary(row: SessionRow): Promise<SessionSummary> {
+  async sessionSummary(row: SessionRow, includeClosed = false): Promise<SessionSummary> {
     if (!this.opened.has(row.id))
       return { ...this.sessionSummaryBase(row), busy: false, agents: [], error: this.errors.get(row.id) ?? "Session unavailable" };
-    const agents = await this.agents(row);
-    return { ...this.sessionSummaryBase(row), busy: agents.some((a) => a.busy), agents };
+    const allAgents = await this.agents(row, undefined, true);
+    return {
+      ...this.sessionSummaryBase(row),
+      busy: allAgents.some((agent) => agent.busy),
+      agents: this.visibleAgents(allAgents, includeClosed),
+    };
   }
 
-  async tree(): Promise<DeviceTree> {
-    const sessions = await Promise.all(this.list().map((row) => this.sessionSummary(row)));
+  async tree(includeClosed = false): Promise<DeviceTree> {
+    const sessions = await Promise.all(this.list().map((row) => this.sessionSummary(row, includeClosed)));
     return { uid: this.uid, name: this.name, sessions, at: Date.now() };
   }
 

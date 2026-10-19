@@ -110,9 +110,22 @@ export interface AgentRef {
 export interface AgentStatus {
   busy: boolean;
   background: number;
+  /** Persisted hidden flag; a hidden ancestor does not change this agent's own value. */
+  closed: boolean;
 }
 
 export type AgentSummary = AgentRef & AgentStatus;
+
+export interface AgentListOptions {
+  /** Include closed agents and their hidden descendants. */
+  closed?: boolean;
+}
+
+export interface CloseAgentBody {
+  closed: boolean;
+  /** Abort the agent's live work and owned descendants before closing it. */
+  abort?: boolean;
+}
 
 export interface SessionSummary {
   id: string;

@@ -17,6 +17,7 @@ interface Locals {
 }
 
 const param = (req: Request, key: string) => String(req.params[key]);
+const includeClosed = (req: Request) => req.query.closed === "1";
 const int = (value: unknown, name: string) => {
   const n = Number(value);
   if (!Number.isSafeInteger(n)) throw invalid(`${name} must be an integer`);
@@ -51,7 +52,7 @@ export function v1(store: Store) {
   // ---------------------------------------------------------- device
   r.get("/device", (_req, res) => res.json(store.deviceInfo()));
   r.get("/skills", (_req, res) => res.json(store.skillsCatalog()));
-  r.get("/tree", route(async (_req, res) => res.json(await store.tree())));
+  r.get("/tree", route(async (req, res) => res.json(await store.tree(includeClosed(req)))));
   r.get("/events", (req, res, next) => {
     try {
       deviceStream(store, req, res);
@@ -70,9 +71,9 @@ export function v1(store: Store) {
   );
 
   // ---------------------------------------------------------- sessions
-  r.get("/sessions", route(async (_req, res) => res.json((await store.tree()).sessions)));
+  r.get("/sessions", route(async (req, res) => res.json((await store.tree(includeClosed(req))).sessions)));
   r.post("/sessions", create, route(async (req, res) => res.status(201).json(await store.create(req.body ?? {}))));
-  r.get("/sessions/:s", route(async (_req, res) => res.json(await store.sessionSummary(L(res).row))));
+  r.get("/sessions/:s", route(async (req, res) => res.json(await store.sessionSummary(L(res).row, includeClosed(req)))));
   r.patch("/sessions/:s", route(async (req, res) => res.json(await store.rename(L(res).row, req.body?.name))));
   r.get("/sessions/:s/compaction", route(async (_req, res) => res.json(store.compactionOf(L(res).row.id))));
   r.patch("/sessions/:s/compaction", route(async (req, res) => res.json(store.setCompaction(L(res).row, req.body ?? {}))));
@@ -110,7 +111,7 @@ export function v1(store: Store) {
   );
 
   // ---------------------------------------------------------- agents
-  r.get("/sessions/:s/agents", route(async (_req, res) => res.json(await store.agents(L(res).row))));
+  r.get("/sessions/:s/agents", route(async (req, res) => res.json(await store.agents(L(res).row, undefined, includeClosed(req)))));
   r.post(
     "/sessions/:s/agents",
     create,
@@ -121,8 +122,7 @@ export function v1(store: Store) {
   r.patch(
     a,
     route(async (req, res) => {
-      store.setAgentName(L(res).row, L(res).c.id as number, req.body?.name);
-      res.json(await store.agentSummary(L(res).row, L(res).c));
+      res.json(await store.patchAgent(L(res).row, L(res).c, req.body ?? {}));
     }),
   );
   r.get(`${a}/events`, route(async (req, res) => agentStream(store, L(res), req, res)));

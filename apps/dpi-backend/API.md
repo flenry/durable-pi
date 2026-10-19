@@ -8,7 +8,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 - **Vocabulary.** A **session** is one harness and one agent database on the device. An **agent** is a pi-durable conversation in that session: the root (`Main`), a fork, or a subagent. The agent id is the conversation id.
 - **Addressing.** `:s` is a session UUID or its unique name (case-insensitive). `:a` is a numeric agent id, `main`, or a unique agent name. Ambiguous names return `409 ambiguous`.
 - **Idempotency.** `POST .../messages` takes a required `requestId`, and pi-durable admits each one exactly once. `POST /sessions`, `POST .../agents` and `POST .../fork` accept an `Idempotency-Key` header of up to 128 characters. A repeat gets the stored response with `Idempotent-Replay: true`. Keys are kept for at least 24h, and reusing a key on another route returns `400 invalid`.
-- **Errors.** Every error has the shape `{ "error": { "code", "message" } }`. Codes: `unauthorized` 401, `not_found` 404, `invalid` 400, `busy` 409 (reject-if-busy), `conflict` 409 (stale App State revision), `ambiguous` 409, `unavailable` 503 (session failed to open), `internal` 500. Clients can also see `offline`: the SDK raises it when a device cannot be reached, and the hub's proxy returns it with 502.
+- **Errors.** Every error has the shape `{ "error": { "code", "message" } }`. Codes: `unauthorized` 401, `not_found` 404, `invalid` 400, `busy` 409 (reject-if-busy or close while live work remains), `conflict` 409 (stale App State revision), `ambiguous` 409, `unavailable` 503 (session failed to open), `internal` 500. Clients can also see `offline`: the SDK raises it when a device cannot be reached, and the hub's proxy returns it with 502.
 - **Versioning.** `/v1` and `apiVersion: 1` in `GET /v1/device` and in every `hello` frame. Changes inside v1 are additive.
 
 ## Routes
@@ -18,21 +18,22 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 | `GET /healthz` | (no auth) | `{ok:true}` |
 | `GET /v1/device` | | `DeviceInfo`: uid, name, hostname, platform, `apiVersion`, `durableVersion`, `startedAt`, models, `defaultModel`, `startDirs`, storage, `codeDir` (the checkout it runs from), capabilities, `jobs` (durable job definitions) |
 | `GET /v1/skills` | | `SkillCatalogEntry[]`: `{name, description, kind: "skill"|"prompt"}` from the device's configured catalog; empty when onboarding is disabled. Requires device auth |
-| `GET /v1/tree` | | `DeviceTree`: sessions with agents and busy/background |
+| `GET /v1/tree` | `?closed=1` includes closed agents and their descendants | `DeviceTree`: sessions with agents and busy/background; closed agents and descendants are hidden by default |
 | `GET /v1/events` | `?docs=app.shared-state` | device stream |
 | `GET /v1/fs/dirs` | `?path=` (empty = start dirs) | `{path, parent, dirs[]}`, one level, directories only |
 | `GET /v1/docs/app.shared-state` | | `{kind, value, revision}` |
-| `GET /v1/sessions` | | `SessionSummary[]` |
+| `GET /v1/sessions` | `?closed=1` includes closed agents and their descendants | `SessionSummary[]` |
 | `POST /v1/sessions` | `{name, cwd, model:{provider,modelId}, thinkingLevel?}` | `201 SessionSummary` |
-| `GET / PATCH / DELETE /v1/sessions/:s` | PATCH `{name}` | summary (with its `compaction` thresholds); DELETE aborts all work, moves the files to `archive/` and returns `{archived}` |
+| `GET / PATCH / DELETE /v1/sessions/:s` | GET `?closed=1`; PATCH `{name}` | summary (with its `compaction` thresholds); DELETE aborts all work, moves the files to `archive/` and returns `{archived}` |
 | `GET / PATCH /v1/sessions/:s/compaction` | PATCH `{enabled?, reserveTokens?, backgroundTokens?, keepRecentTokens?}` | the session's automatic compaction thresholds, read by pi-durable at its next request. Values are margins: the blocking summary starts at the model's context window minus `reserveTokens`, and the background one `backgroundTokens` earlier (0 turns it off). Default: a background summary at 200k tokens and a blocking one at 250k, or pi-durable's margins on smaller windows. Switching an agent to a window the thresholds do not fit refits them |
 | `GET /v1/sessions/:s/events` | | session stream |
 | `GET /v1/sessions/:s/tasks` | `?status=live\|terminal&limit=` | task nodes / recent outcomes |
 | `POST /v1/sessions/:s/tasks/:taskId/abort` | | `{status}` |
 | `GET /v1/sessions/:s/inspect` | | recovery inspection |
 | `GET /v1/sessions/:s/submissions/:id` | `?waitMs=` (≤300000) | `SendResult`, optionally long-polled |
-| `GET / POST /v1/sessions/:s/agents` | POST `{from?, name?}` | `AgentSummary[]` / `201 AgentSummary` |
-| `GET / PATCH .../agents/:a` | PATCH `{name}` | `AgentDetail` (config with `readOnly`, every tool with `replay`, `writes` and `offered`, extensions) / summary |
+| `GET / POST /v1/sessions/:s/agents` | GET `?closed=1`; POST `{from?, name?}` | `AgentSummary[]` / `201 AgentSummary`; default listing hides closed agents and descendants |
+| `GET / PATCH .../agents/:a` | PATCH `{name}` or `{closed: boolean, abort?: boolean}` | `AgentDetail` (config with `readOnly`, every tool with `replay`, `writes` and `offered`, extensions) / `AgentSummary` |
+| Close/reopen behavior | `{closed:true, abort?:true}`; reopen with `{closed:false}` | Closing Main is `400 invalid`. Live work on the agent or its owned descendants returns `409 busy` unless `abort:true`; work is aborted before the closed flag is saved. The flag is a durable per-conversation document, forks start open, and closing preserves history and related resources. `AgentSummary.closed` is always present. `GET /v1/tree`, `GET /v1/sessions`, `GET /v1/sessions/:s`, and `GET .../agents` hide closed agents and descendants by default; add `?closed=1` to include them. |
 | `GET .../agents/:a/events` | `?docs=demo.job-runs` | agent stream |
 | `GET .../agents/:a/entries` | `?scope=all\|active&cursor=&limit=` | `{items, next}` stored history; `limit` defaults to 500 (max 2000). `scope=active` returns `{items}`, the active context, unpaged |
 | `GET .../agents/:a/transcript` | `?format=json\|markdown` | normalized transcript |

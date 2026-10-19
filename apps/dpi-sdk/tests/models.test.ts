@@ -172,10 +172,10 @@ test("reset entry drops the old context; aborted partials and unmatched results 
 
 test("session lineage and network tree nest forks and subagents", () => {
   const agents: AgentSummary[] = [
-    { id: 1, name: "Main", named: false, kind: "root", busy: true, background: 0 },
-    { id: 4, name: "alt", named: true, kind: "fork", parentId: 1, forkedAt: 3, busy: false, background: 0 },
-    { id: 6, name: "Subagent #6", named: false, kind: "subagent", ownerAgentId: 4, ownerTaskId: 9, busy: true, background: 0 },
-    { id: 7, name: "Root #7", named: false, kind: "root", busy: false, background: 1 },
+    { id: 1, name: "Main", named: false, kind: "root", busy: true, background: 0, closed: false },
+    { id: 4, name: "alt", named: true, kind: "fork", parentId: 1, forkedAt: 3, busy: false, background: 0, closed: false },
+    { id: 6, name: "Subagent #6", named: false, kind: "subagent", ownerAgentId: 4, ownerTaskId: 9, busy: true, background: 0, closed: false },
+    { id: 7, name: "Root #7", named: false, kind: "root", busy: false, background: 1, closed: false },
   ];
   assert.deepEqual(lineage(agents, 4).map((a) => a.id), [1, 4]);
   const session = new SessionModel();
