@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Guard approval component test</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      import { createApp } from "vue";
+      import TranscriptItem from "/src/components/TranscriptItem.vue";
+      import { selected } from "/src/client/store";
+
+      selected.value = { deviceId: "local", sessionId: "approval-test", agentId: 1 };
+      const hash = "a".repeat(64);
+      const result = {
+        kind: "tool-result",
+        id: 1,
+        name: "bash",
+        text:
+          `DPI_GUARD_BLOCKED: Blocked destructive command (rm -rf): ` +
+          `Recursive force-delete. The user must reply exactly: approve ${hash}. Do not self-approve.`,
+        isError: true,
+      };
+      const guardApproval = {
+        request: { hash, label: "rm -rf", reason: "Recursive force-delete." },
+        status: "pending",
+      };
+      createApp(TranscriptItem, { item: result, guardApproval }).mount("#app");
+    </script>
+  </body>
+</html>

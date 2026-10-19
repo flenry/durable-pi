@@ -1,13 +1,40 @@
 <script setup lang="ts">
+import { ref } from "vue";
 import { Activity, Braces, Check, GitFork, Info, Layers, Wrench } from "lucide-vue-next";
 import type { TranscriptItem, ToolCallView } from "@sdk/transcript";
 import { markdown } from "../client/markdown";
-import { json } from "../client/store";
+import { agentHandle, attempt, json } from "../client/store";
 import { runByCall, runById } from "../client/jobs";
+import { newId } from "../client/ids";
+import type { GuardApprovalState } from "../client/guard-approval";
 import JobCard from "./JobCard.vue";
 
-defineProps<{ item: TranscriptItem }>();
+const props = defineProps<{ item: TranscriptItem; guardApproval?: GuardApprovalState }>();
 const emit = defineEmits<{ fork: [entryId: number] }>();
+const sendingApproval = ref(false);
+const approvalSent = ref(false);
+
+async function approveOnce() {
+  const approval = props.guardApproval;
+  const handle = agentHandle.value;
+  if (
+    !approval ||
+    approval.status !== "pending" ||
+    sendingApproval.value ||
+    approvalSent.value ||
+    !handle
+  )
+    return;
+
+  sendingApproval.value = true;
+  try {
+    approvalSent.value = Boolean(
+      await attempt(() => handle.send(`approve ${approval.request.hash}`, "followUp", newId())),
+    );
+  } finally {
+    sendingApproval.value = false;
+  }
+}
 const statusLabel = (call: ToolCallView) =>
   call.status === "error" ? "Error" : call.status === "done" ? "Done" : call.status;
 const entryClass = (item: TranscriptItem) =>
@@ -98,7 +125,7 @@ const entryClass = (item: TranscriptItem) =>
       <div v-if="item.error" class="message-error">{{ item.error }}</div></template
     >
     <template v-else-if="item.kind === 'tool-result'"
-      ><details class="tool-result" :class="{ failed: item.isError }">
+      ><details class="tool-result" :class="{ failed: item.isError }" :open="!!guardApproval">
         <summary>
           <Check v-if="!item.isError" :size="18" /><Info v-else :size="18" /><strong>{{
             item.name
@@ -112,7 +139,48 @@ const entryClass = (item: TranscriptItem) =>
             <GitFork :size="18" />Fork
           </button>
         </summary>
-        <pre>{{ item.text }}</pre>
+        <section
+          v-if="guardApproval"
+          class="guard-approval"
+          aria-label="Destructive command approval"
+        >
+          <div class="guard-approval-heading">
+            <Info :size="18" aria-hidden="true" />
+            <span>Destructive command blocked</span>
+          </div>
+          <code class="guard-approval-command">{{ guardApproval.request.label }}</code>
+          <p class="guard-approval-reason">{{ guardApproval.request.reason }}</p>
+          <div v-if="guardApproval.status === 'pending'" class="guard-approval-actions">
+            <button
+              class="guard-approval-button"
+              :disabled="sendingApproval || approvalSent || !agentHandle"
+              @click="approveOnce"
+            >
+              <Check v-if="approvalSent" :size="18" aria-hidden="true" />
+              {{
+                approvalSent
+                  ? "Approval sent"
+                  : sendingApproval
+                    ? "Sending approval…"
+                    : "Approve once"
+              }}
+            </button>
+            <span v-if="approvalSent" class="guard-approval-status" aria-live="polite">
+              Approval message sent to the root agent.
+            </span>
+          </div>
+          <p
+            v-else-if="guardApproval.status === 'sent'"
+            class="guard-approval-status"
+            aria-live="polite"
+          >
+            Approval message sent in this conversation.
+          </p>
+          <p v-else class="guard-approval-status">
+            A newer blocked attempt for this command replaces this request.
+          </p>
+        </section>
+        <pre v-else>{{ item.text }}</pre>
       </details></template
     >
     <div v-else-if="item.kind === 'tool'" class="live-tool">

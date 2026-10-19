@@ -15,6 +15,7 @@ import {
 } from "lucide-vue-next";
 import type { AgentSummary } from "@sdk/api";
 import { lineage } from "@sdk/models";
+import { guardApprovalStates, type GuardApprovalState } from "../client/guard-approval";
 import TranscriptItem from "./TranscriptItem.vue";
 import DeviceIcon from "./DeviceIcon.vue";
 import Composer from "./Composer.vue";
@@ -23,6 +24,7 @@ import {
   agent,
   agentHandle,
   agentState,
+  agentSummary,
   device,
   notify,
   preset,
@@ -39,6 +41,11 @@ const chat = ref<HTMLElement>();
 const lineageNav = ref<HTMLElement>();
 const picker = ref(false);
 const items = computed(() => agentState.value.items);
+const guardApprovals = computed(() =>
+  agentSummary.value?.kind === "root"
+    ? guardApprovalStates(items.value)
+    : new Map<number, GuardApprovalState>(),
+);
 const liveItem = computed(() => items.value.some((i) => i.kind === "assistant" && i.streaming));
 const runningTool = computed(() =>
   items.value.some(
@@ -303,7 +310,13 @@ watch(
             </button>
           </div>
         </div>
-        <TranscriptItem v-for="item in items" :key="item.id" :item="item" @fork="fork" />
+        <TranscriptItem
+          v-for="(item, index) in items"
+          :key="`${selected?.deviceId}/${selected?.sessionId}/${selected?.agentId}/${item.id}/${index}`"
+          :item="item"
+          :guard-approval="guardApprovals.get(index)"
+          @fork="fork"
+        />
         <div v-if="agentState.running && !liveItem && !runningTool" class="entry live-generation">
           <div class="message-label">
             AGENT
