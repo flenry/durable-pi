@@ -43,6 +43,7 @@ try {
       agents: [
         { id: 1, name: "Main", named: false, kind: "root", busy: false, background: 0, closed: false },
         ...((includeClosed || !closed) ? [{ id: 2, name: "Worker", named: true, kind: "subagent", ownerAgentId: 1, busy: false, background: 0, closed }] : []),
+        { id: 3, name: "Busy worker", named: true, kind: "subagent", ownerAgentId: 1, busy: true, background: 0, closed: false },
       ],
     }],
   });
@@ -103,9 +104,17 @@ try {
   await page.getByRole("button", { name: "Reopen agent Worker" }).click();
   await expect(page.getByRole("button", { name: "Close agent Worker" })).toBeVisible();
   assert.ok(calls.some((call) => call.method === "PATCH" && call.closed === false));
+
+  const bulkClose = page.getByRole("button", { name: "Close 1 finished" });
+  await expect(bulkClose).toBeVisible();
+  await bulkClose.click();
+  await expect.poll(() => page.evaluate(() => window.__agentCloseState.ui.error)).toBe("");
+  await expect(page.getByRole("button", { name: "Reopen agent Worker" })).toBeVisible();
+  await expect(page.getByRole("treeitem", { name: /Busy worker/ })).toBeVisible();
+  assert.ok(calls.some((call) => call.method === "PATCH" && call.closed === true && !call.abort));
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), "agent actions fit phone width");
   assert.deepEqual(errors, []);
-  console.log("PASS agent close: idle, busy abort confirmation, show/reopen closed, phone-width controls");
+  console.log("PASS agent close: idle, busy abort confirmation, reopen, bulk close skips busy, phone width");
 } finally {
   await browser?.close();
   await vite.close();

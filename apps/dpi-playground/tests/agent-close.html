@@ -18,6 +18,7 @@
       const agents = [
         { id: 1, name: "Main", named: false, kind: "root", busy: false, background: 0, closed: false },
         { id: 2, name: "Worker", named: true, kind: "subagent", ownerAgentId: 1, busy: false, background: 0, closed: false },
+        { id: 3, name: "Busy worker", named: true, kind: "subagent", ownerAgentId: 1, busy: true, background: 0, closed: false },
       ];
       const session = {
         id: "close-test", name: "Close test", cwd: "/tmp", model: "test", createdAt: 1,

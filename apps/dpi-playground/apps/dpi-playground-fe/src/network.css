@@ -282,6 +282,14 @@
   opacity: 0.35;
   background: none;
 }
+.tree-row .acts .close-finished-action {
+  width: auto;
+  min-width: max-content;
+  gap: 4px;
+  padding: 0 7px;
+  font-size: 11px;
+  white-space: nowrap;
+}
 .tree-row .acts .danger-action:hover {
   color: #ff8a80;
 }
@@ -611,6 +619,11 @@
   .tree-row.agent .acts .icon-button {
     width: 34px;
     height: 34px;
+  }
+  .tree-row.agent .acts .close-finished-action {
+    width: auto;
+    min-width: max-content;
+    padding: 0 7px;
   }
   .tree-resizer {
     display: none;

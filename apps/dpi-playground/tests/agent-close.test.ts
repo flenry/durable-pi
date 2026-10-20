@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { AgentSummary } from "../../dpi-sdk/src/api.js";
 import { DpiError } from "../../dpi-sdk/src/errors.js";
 import {
+  closableChildren,
   isBusyCloseError,
   mergeClosedAgents,
   parentAfterClosing,
@@ -23,6 +24,21 @@ const tree = [
   agent({ id: 2, kind: "subagent", ownerAgentId: 1, name: "Worker" }),
   agent({ id: 3, kind: "fork", parentId: 2, forkedAt: 4, name: "Nested fork" }),
 ];
+
+test("bulk close selects only open idle descendants without busy descendants", () => {
+  const agents = [
+    agent({ id: 1, kind: "root" }),
+    agent({ id: 2, kind: "subagent", ownerAgentId: 1 }),
+    agent({ id: 3, kind: "fork", parentId: 2 }),
+    agent({ id: 4, kind: "subagent", ownerAgentId: 1, busy: true }),
+    agent({ id: 5, kind: "fork", parentId: 1, closed: true }),
+    agent({ id: 6, kind: "subagent", ownerAgentId: 1 }),
+    agent({ id: 7, kind: "subagent", ownerAgentId: 2, busy: true }),
+    agent({ id: 8, kind: "fork", parentId: 1 }),
+  ];
+  assert.deepEqual(closableChildren(agents, 1).map(({ id }) => id), [3, 6, 8]);
+  assert.deepEqual(closableChildren(agents, 2).map(({ id }) => id), [3]);
+});
 
 test("closing the selected agent or an ancestor falls back outside the closed branch", () => {
   assert.equal(parentAfterClosing(tree, 2, 2), 1);

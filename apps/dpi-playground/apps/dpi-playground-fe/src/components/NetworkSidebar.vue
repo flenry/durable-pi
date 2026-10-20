@@ -7,6 +7,7 @@ import { networkTree, type TreeNode } from "@sdk/models";
 import TreeRow from "./TreeRow.vue";
 import { deviceClient, hub, message } from "../client/hub";
 import {
+  closableChildren,
   isBusyCloseError,
   mergeClosedAgents,
   parentAfterClosing,
@@ -72,6 +73,11 @@ const deviceOf = (node: TreeNode) =>
     (d) => d.id === (node.type === "device" ? node.device.id : node.deviceId),
   );
 const isOnline = (node: TreeNode) => deviceOf(node)?.status === "online";
+const closeFinishedCount = (node: TreeNode) => {
+  if (node.type !== "agent" || node.agent.kind !== "root") return 0;
+  const session = deviceOf(node)?.tree?.sessions.find((item) => item.id === node.sessionId);
+  return session ? closableChildren(session.agents, node.agent.id).length : 0;
+};
 const deviceStates = computed(() =>
   network.devices.value.map((device) => `${device.id}:${device.status}`).join("|"),
 );
@@ -200,6 +206,42 @@ async function action(node: TreeNode, name: string) {
     return;
   }
   const a = node.agent;
+  if (name === "close-finished" && a.kind === "root") {
+    if (pendingAgents.value.has(node.key)) return;
+    const currentSession = device.tree?.sessions.find((item) => item.id === node.sessionId);
+    const closable = currentSession ? closableChildren(currentSession.agents, a.id) : [];
+    if (!closable.length) return;
+    pendingAgents.value = new Set(pendingAgents.value).add(node.key);
+    ui.error = "";
+    let closedCount = 0;
+    const failures: string[] = [];
+    try {
+      for (const child of closable) {
+        try {
+          await client.agent(node.sessionId, child.id).setClosed(true);
+          closedCount++;
+        } catch (error) {
+          failures.push(`${child.name}: ${message(error)}`);
+        }
+      }
+      let refreshFailure = "";
+      if (closedCount) {
+        try {
+          await refreshTree(device.id, false, true);
+        } catch (error) {
+          refreshFailure = ` Tree refresh failed: ${message(error)}`;
+        }
+      }
+      if (failures.length || refreshFailure) {
+        ui.error = `Closed ${closedCount} of ${closable.length} finished agents.${refreshFailure}${failures.length ? ` ${failures.join("; ")}` : ""}`;
+      } else notify(`Closed ${closedCount} finished agent${closedCount === 1 ? "" : "s"}.`);
+    } finally {
+      const pending = new Set(pendingAgents.value);
+      pending.delete(node.key);
+      pendingAgents.value = pending;
+    }
+    return;
+  }
   if (name === "close" || name === "reopen") {
     if (pendingAgents.value.has(node.key)) return;
     pendingAgents.value = new Set(pendingAgents.value).add(node.key);
@@ -318,6 +360,7 @@ function keydown(e: KeyboardEvent) {
           :focused="focusKey === row.node.key"
           :online="isOnline(row.node)"
           :action-busy="pendingAgents.has(row.node.key)"
+          :close-finished-count="closeFinishedCount(row.node)"
           @toggle="toggle(row.node.key)"
           @activate="activate(row.node)"
           @action="action(row.node, $event)"

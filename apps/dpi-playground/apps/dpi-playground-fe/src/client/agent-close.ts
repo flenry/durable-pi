@@ -6,6 +6,38 @@ export const isBusyCloseError = (error: unknown) =>
 
 const parentId = (agent: AgentSummary) => agent.parentId ?? agent.ownerAgentId;
 
+/** Open idle descendants that can be closed without aborting any work. */
+export function closableChildren(
+  agents: readonly AgentSummary[],
+  rootId: number,
+): AgentSummary[] {
+  const descendants = new Set<number>();
+  const pending = [rootId];
+  while (pending.length) {
+    const parent = pending.pop()!;
+    for (const agent of agents) {
+      if (parentId(agent) !== parent || descendants.has(agent.id)) continue;
+      descendants.add(agent.id);
+      pending.push(agent.id);
+    }
+  }
+  return agents.filter((agent) => {
+    if (!descendants.has(agent.id) || agent.kind === "root" || agent.closed || agent.busy) return false;
+    const seen = new Set<number>();
+    const todo = [agent.id];
+    while (todo.length) {
+      const parent = todo.pop()!;
+      for (const child of agents) {
+        if (parentId(child) !== parent || seen.has(child.id)) continue;
+        seen.add(child.id);
+        if (child.busy) return false;
+        todo.push(child.id);
+      }
+    }
+    return true;
+  });
+}
+
 /** Find the first open ancestor outside the subtree being closed. */
 export function parentAfterClosing(
   agents: readonly AgentSummary[],

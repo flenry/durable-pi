@@ -26,6 +26,7 @@ const props = defineProps<{
   focused: boolean;
   online: boolean;
   actionBusy?: boolean;
+  closeFinishedCount?: number;
 }>();
 const emit = defineEmits<{ toggle: []; activate: []; action: [name: string] }>();
 
@@ -173,6 +174,16 @@ const title = computed(() => {
         ><i class="dot bg" />{{ background }}</span
       >
       <span class="acts" @click.stop>
+        <button
+          v-if="agent.kind === 'root' && (closeFinishedCount ?? 0) > 0"
+          class="icon-button close-finished-action"
+          :disabled="!online || actionBusy"
+          :aria-label="`Close ${closeFinishedCount} finished`"
+          :title="`Close ${closeFinishedCount} finished child agent${closeFinishedCount === 1 ? '' : 's'}`"
+          @click="emit('action', 'close-finished')"
+        >
+          <Archive :size="14" /><span>Close {{ closeFinishedCount }} finished</span>
+        </button>
         <button
           class="icon-button"
           :disabled="!online || actionBusy"
