@@ -133,7 +133,7 @@ const ReadOnlyPolicy = defineDoc<ReadOnlyPolicyState>({
   checkpointWhen: () => true,
 });
 
-type AgentCloseState = { closed: boolean };
+type AgentCloseState = { closed: boolean; autoCloseKey?: string };
 const AgentClose = defineDoc<AgentCloseState>({
   kind: "dpi.store-agent-close",
   version: 1,
@@ -717,7 +717,10 @@ export class Store {
       const guards = guardApprovals ? createGuardsExtension(guardApprovals) : undefined;
       const jobs = createJobs({ shared: this.shared, sessionId: row.id, childExtensions: guards ? [guards] : [] });
       const compaction = () => this.compactionOf(row.id);
-      const playground = createPlayground(this.shared, row.id, this.spawnSession, jobs);
+      const autoCloseConversation = this.onboardOptions?.autoClose
+        ? (conversationId: number, key: string) => this.autoCloseConversation(row, conversationId, key)
+        : undefined;
+      const playground = createPlayground(this.shared, row.id, this.spawnSession, jobs, autoCloseConversation);
       registry.install(playground);
       // Custom extensions are installed but not selected: an agent turns them on in its own selection.
       const addons = createAddons({ offline: this.options.provider === "faux", guards });
@@ -730,6 +733,7 @@ export class Store {
             device: this.name,
             nameConversation: (conversationId, name) => this.setAgentName(row, conversationId, name),
             abortTask: (taskId) => this.abortTask(this.harness(row), taskId),
+            autoCloseConversation,
           })
         : [];
       const ticketScheduler = onboardExtensions
@@ -1154,13 +1158,14 @@ export class Store {
     return ids;
   }
 
-  async setAgentClosed(row: SessionRow, c: Conversation, closed: unknown, abort?: unknown) {
+  async setAgentClosed(row: SessionRow, c: Conversation, closed: unknown, abort?: unknown, autoCloseKey?: string) {
     if (typeof closed !== "boolean") throw invalid("closed must be a boolean");
     if (abort !== undefined && typeof abort !== "boolean") throw invalid("abort must be a boolean");
     if (!closed && abort === true) throw invalid("abort can only be used when closing an agent");
     if (closed && c.id === ROOT_CONVERSATION_ID) throw invalid("The root conversation cannot be closed");
 
     const h = this.harness(row);
+    if (autoCloseKey && (await h.snapshot(AgentClose, c.id, ctx))?.autoCloseKey === autoCloseKey) return;
     if (closed) {
       const records = await this.scanAll(h);
       const subtree = this.ownedConversationIds(records, c.id as number);
@@ -1177,11 +1182,21 @@ export class Store {
       }
     }
 
-    await c.commit(async (tx) => {
+    const changed = await c.commit(async (tx) => {
       const state = await tx.doc(AgentClose, c.id);
+      if (autoCloseKey && state.autoCloseKey === autoCloseKey) return false;
       state.closed = closed;
+      if (autoCloseKey) state.autoCloseKey = autoCloseKey;
+      return true;
     }, ctx);
-    this.notify();
+    if (changed) this.notify();
+  }
+
+  private async autoCloseConversation(row: SessionRow, conversationId: number, key: string) {
+    const h = this.harness(row);
+    const c = await h.conversation(conversationId as ConversationId, ctx);
+    if (!c || !key) return;
+    await this.setAgentClosed(row, c, true, undefined, key);
   }
 
   async patchAgent(row: SessionRow, c: Conversation, body: Record<string, unknown>): Promise<AgentSummary> {

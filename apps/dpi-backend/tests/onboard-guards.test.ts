@@ -299,7 +299,7 @@ test("built-in subagents cannot shed guards when the parent has opted out", asyn
       const submission = await store.submitAuthenticatedUserMessage(row, c, { content: "launch built-in child", requestId: "launch-built-in-child" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       assert.equal(existsSync(target), true, "the child's destructive command is blocked");
-      const child = (await store.agents(row)).find((agent) => agent.kind === "subagent");
+      const child = (await store.agents(row, undefined, true)).find((agent) => agent.kind === "subagent");
       assert.ok(child);
       const childConversation = (await store.resolveAgent(session.id, String(child.id))).c;
       assert.ok((await store.agentDetail(row, childConversation)).extensions.includes("durable-guards"));
@@ -359,7 +359,7 @@ test("delegated expert children inherit destructive guards", async () => {
       const submission = await store.submitAuthenticatedUserMessage(row, c, { content: "launch delegated destructive command", requestId: "launch-guarded-delegate" });
       assert.equal((await store.settled(h, submission.id as number, 20_000)).status, "done");
       assert.equal(existsSync(target), true, "the delegated bash command is blocked");
-      const child = (await store.agents(row)).find((agent) => agent.kind === "subagent");
+      const child = (await store.agents(row, undefined, true)).find((agent) => agent.kind === "subagent");
       assert.ok(child, "delegate creates an owned child");
       const childConversation = (await store.resolveAgent(session.id, String(child.id))).c;
       assert.ok((await store.agentDetail(row, childConversation)).extensions.includes("durable-guards"));

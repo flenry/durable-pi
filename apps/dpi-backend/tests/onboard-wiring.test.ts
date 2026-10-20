@@ -11,7 +11,7 @@ import { createPlaybookExtension } from "../src/onboard/playbook.js";
 import { Store } from "../src/store.js";
 import { faux, tempStore, until } from "./helpers.js";
 
-const ONBOARD_ENV_KEYS = ["DPI_ONBOARD", "PI_SETUP_DIR", "DPI_MEMORY", "DPI_MEMORY_HOST", "DPI_SKILLS_EXCLUDE", "DPI_MAX_CHILDREN", "DPI_TICKETS"] as const;
+const ONBOARD_ENV_KEYS = ["DPI_ONBOARD", "PI_SETUP_DIR", "DPI_MEMORY", "DPI_MEMORY_HOST", "DPI_SKILLS_EXCLUDE", "DPI_MAX_CHILDREN", "DPI_TICKETS", "DPI_AUTOCLOSE"] as const;
 
 type OnboardEnv = Partial<Record<(typeof ONBOARD_ENV_KEYS)[number], string | undefined>>;
 
@@ -63,6 +63,9 @@ test("DPI_ONBOARD defaults off, accepts only explicit values, and validates conf
   assert.equal(onboardOptionsFromEnv({}).maxChildren, 2);
   assert.equal(onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "4" }).maxChildren, 4);
   assert.equal(onboardOptionsFromEnv({}).ticketScheduler, false);
+  assert.equal(onboardOptionsFromEnv({}).autoClose, true);
+  assert.equal(onboardOptionsFromEnv({ DPI_AUTOCLOSE: "0" }).autoClose, false);
+  assert.throws(() => onboardOptionsFromEnv({ DPI_AUTOCLOSE: "true" }), /DPI_AUTOCLOSE must be 0 or 1/);
   assert.equal(onboardOptionsFromEnv({ DPI_TICKETS: "1" }).ticketScheduler, true);
   assert.throws(() => onboardOptionsFromEnv({ DPI_TICKETS: "true" }), /DPI_TICKETS must be 0 or 1/);
   assert.throws(() => onboardOptionsFromEnv({ DPI_MAX_CHILDREN: "0" }), /DPI_MAX_CHILDREN/);

@@ -65,6 +65,7 @@ export interface Ticket {
   blockedNote?: string;
   runTaskId?: number;
   runToken?: string;
+  plannerConversationId?: number;
 }
 
 export interface TicketPlan {
@@ -538,6 +539,7 @@ export interface TicketExtensionOptions {
   timer?: (deadline: number, signal?: AbortSignal) => Promise<void>;
   schedulerEnabled?: boolean;
   nameConversation?: (conversationId: number, name: string) => void;
+  autoCloseConversation?: (conversationId: number, key: string) => Promise<void>;
   plan?: (request: string, cwd: string, context: Context) => Promise<TicketPlanResult>;
 }
 
@@ -615,7 +617,7 @@ function planningInstructions(request: string, cwd: string, repoProblem?: string
   return `You are a planning child. Plan the user's request for a durable unattended ticket. Ask no more than one necessary clarification question; if a question is needed, answer only JSON {"question":"one focused question"}. Otherwise output only JSON with title, goal, decisions (string[]), acceptanceCriteria (string[]), plan (array of {id,expert,task,dependsOn,verify?}), tier (fix|small|medium|large), and repo (absolute repository root). Use this repo by default: ${cwd}. ${repoProblem ? `It is not usable: ${repoProblem}. Choose another repo only if the request names one; otherwise ask the user.` : "The repository must have an origin remote and must not be under a work/work-laptop/office path."} Ask one question at a time through the root orchestrator; do not guess scope, safety, or acceptance. Define 3–7 observable criteria. Use exact expert names from the roster. Plan small/fix work as one slice where possible; medium/large plans should end with QA when user-facing and reviewer last. Request: ${request}`;
 }
 
-async function planInChild(request: string, cwd: string, api: ToolExecutionApi, ctx: Context, options: TicketExtensionOptions): Promise<TicketPlanResult> {
+async function planInChild(request: string, cwd: string, api: ToolExecutionApi, ctx: Context, options: TicketExtensionOptions): Promise<{ decision: TicketPlanResult; childId: number }> {
   const repoProblem = await validateTicketRepo(cwd, options.process ?? boundedRunner, ctx.abortSignal);
   let childId: ConversationId | undefined;
   await api.commit(async (tx) => {
@@ -642,8 +644,9 @@ async function planInChild(request: string, cwd: string, api: ToolExecutionApi, 
   const text = answer?.model?.filter((message) => message.role === "assistant").map((message) => messageText(message as never)).join("\n").trim();
   if (!text) throw new Error("Ticket planner returned no answer");
   const decoded = jsonFromAnswer(text);
-  if (isRecord(decoded) && typeof decoded.question === "string" && decoded.question.trim()) return { question: decoded.question.trim() };
-  return normalizeTicketPlan(decoded);
+  if (isRecord(decoded) && typeof decoded.question === "string" && decoded.question.trim())
+    return { decision: { question: decoded.question.trim() }, childId: childId as number };
+  return { decision: normalizeTicketPlan(decoded), childId: childId as number };
 }
 
 function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions) {
@@ -763,6 +766,12 @@ function createTicketRunTask(store: TicketStore, options: TicketExtensionOptions
             status: "terminal",
             outcome: { status: "completed", result: { ticketId: ticket.id, status: "done", pr } },
           }), ctx);
+          const completedChildren = [
+            ...Object.values(task.state.checkpoint.children),
+            ...(ticket.plannerConversationId === undefined ? [] : [ticket.plannerConversationId]),
+          ];
+          for (const childId of new Set(completedChildren))
+            await options.autoCloseConversation?.(childId, `ticket-done:${task.id}`).catch(() => {});
         } catch (error) {
           if (runtime.signal.aborted) return;
           await blockRun(task, runtime, ctx, store, `Project history note failed: ${shortError(error)}`, now());
@@ -1152,11 +1161,11 @@ export function createTicketsExtension(host: TicketStateHost, options: TicketExt
       rootOnly(api);
       const cwd = (await api.agent(ctx)).cwd;
       if (!cwd) throw new Error("add_ticket requires a working directory");
-      const decision = options.plan
-        ? await options.plan(args.request, cwd, ctx)
+      const planned = options.plan
+        ? { decision: await options.plan(args.request, cwd, ctx), childId: undefined }
         : await planInChild(args.request, cwd, api, ctx, options);
-      if ("question" in decision) return response(`Ask the user this one question, then call add_ticket again with the answer included: ${decision.question}`);
-      const normalized = normalizeTicketPlan(decision);
+      if ("question" in planned.decision) return response(`Ask the user this one question, then call add_ticket again with the answer included: ${planned.decision.question}`);
+      const normalized = normalizeTicketPlan(planned.decision);
       const problem = await validateTicketRepo(normalized.repo, process, ctx.abortSignal);
       if (problem) throw new Error(`Cannot create ticket: ${problem}`);
       const createdAt = new Date(now()).toISOString();
@@ -1167,6 +1176,7 @@ export function createTicketsExtension(host: TicketStateHost, options: TicketExt
         id,
         device: options.device,
         status: "ready",
+        ...(planned.childId === undefined ? {} : { plannerConversationId: planned.childId }),
         log: [{ at: createdAt, text: "planned and queued" }],
         createdAt,
         updatedAt: createdAt,
@@ -1223,6 +1233,8 @@ export function createTicketsExtension(host: TicketStateHost, options: TicketExt
     execute: async (args: { id: string; status?: TicketStatus; note?: string }, api: ToolExecutionApi) => {
       rootOnly(api);
       const ticket = await store.update(args.id, args.status, args.note, now());
+      if (ticket.status === "done" && ticket.plannerConversationId !== undefined)
+        await options.autoCloseConversation?.(ticket.plannerConversationId, `ticket-done:${api.taskId}`).catch(() => {});
       return response(`Ticket ${ticket.id} updated: ${ticket.status}${ticket.blockedNote ? ` — ${ticket.blockedNote}` : ""}`);
     },
   });

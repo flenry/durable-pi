@@ -58,7 +58,7 @@ function fixtureClient(): MemoryClient {
   };
 }
 
-function expertHarnessApi(options: { taskId?: number; conversationId?: number; cwd?: string } = {}) {
+function expertHarnessApi(options: { taskId?: number; conversationId?: number; cwd?: string; childStatus?: string } = {}) {
   const taskId = options.taskId ?? 10;
   const conversationId = options.conversationId ?? ROOT_CONVERSATION_ID;
   const state = {
@@ -114,17 +114,17 @@ function expertHarnessApi(options: { taskId?: number; conversationId?: number; c
     conversation: async (id: number) => ({
       submit: async (submission: { content: string; requestId: string }) => {
         state.submissions.push(submission);
-        return { wait: async () => ({ status: "done", type: "input", answer: id }) };
+        return { wait: async () => ({ status: options.childStatus ?? "done", type: "input", answer: id }) };
       },
     }),
   };
   return { api, state, tx };
 }
 
-function extensionForExperts(options: { maxChildren?: number } = {}) {
+function extensionForExperts(options: { maxChildren?: number; autoCloseConversation?: (id: number, key: string) => Promise<void> } = {}) {
   const client = fixtureClient();
   const children = ["coding-tools", "memory", "skills", "web"].map((name) => ({ name })) as never[];
-  return createExpertsExtension(client, { maxChildren: options.maxChildren ?? 2, childExtensions: children });
+  return createExpertsExtension(client, { maxChildren: options.maxChildren ?? 2, childExtensions: children, autoCloseConversation: options.autoCloseConversation });
 }
 
 async function invokeDelegate(
@@ -276,6 +276,20 @@ test("delegate creates a configured reviewer child with trusted identity and rep
 
   await delegate.execute({ expert: "reviewer", task: "Review the current changes." } as never, fixture.api as never, context);
   assert.equal(fixture.state.conversations.length, 1, "replaying a tool call reuses its owned child");
+});
+
+test("delegate auto-closes only after a successful child result", async () => {
+  const closes: { id: number; key: string }[] = [];
+  const extension = extensionForExperts({ autoCloseConversation: async (id, key) => { closes.push({ id, key }); } });
+  const delegate = extension.tools?.find((tool) => tool.name === "delegate");
+  assert.ok(delegate);
+  const success = expertHarnessApi({ taskId: 31 });
+  await delegate.execute({ expert: "reviewer", task: "Review." } as never, success.api as never, context);
+  assert.deepEqual(closes, [{ id: ROOT_CONVERSATION_ID + 1, key: "delegate:31" }]);
+
+  const failed = expertHarnessApi({ taskId: 32, childStatus: "aborted" });
+  await delegate.execute({ expert: "reviewer", task: "Review." } as never, failed.api as never, context);
+  assert.equal(closes.length, 1, "aborted child results remain open");
 });
 
 test("delegate honors profile excludeTools even when the expert is not read-only", async () => {

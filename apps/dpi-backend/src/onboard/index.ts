@@ -20,6 +20,7 @@ export interface OnboardInstallContext {
   device: string;
   nameConversation: (conversationId: number, name: string) => void;
   abortTask: (taskId: number) => Promise<unknown>;
+  autoCloseConversation?: (conversationId: number, key: string) => Promise<void>;
 }
 
 /** Install the opt-in onboarding extensions and configure the exact base tools delegated experts inherit. */
@@ -38,6 +39,7 @@ export function installOnboard(registry: Registry, options: OnboardOptions, cont
       maxChildren: options.maxChildren,
       childExtensions: [...context.childBaseExtensions, context.guards, memory, skills, web],
       nameConversation: context.nameConversation,
+      autoCloseConversation: context.autoCloseConversation,
     }),
     createTicketsExtension(context.shared, {
       device: context.device,
@@ -45,6 +47,7 @@ export function installOnboard(registry: Registry, options: OnboardOptions, cont
       memory: client,
       schedulerEnabled: options.ticketScheduler,
       nameConversation: context.nameConversation,
+      autoCloseConversation: context.autoCloseConversation,
     }),
     createRemindExtension({ abortTask: context.abortTask }),
   ];

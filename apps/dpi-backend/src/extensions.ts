@@ -100,7 +100,13 @@ export type SpawnSession = (input: {
   prompt?: string;
 }) => Promise<{ session: SessionSummary; submissionId?: number }>;
 
-export function createPlayground(shared: SharedState, sessionId: string, spawn: SpawnSession, jobs: Jobs) {
+export function createPlayground(
+  shared: SharedState,
+  sessionId: string,
+  spawn: SpawnSession,
+  jobs: Jobs,
+  autoCloseConversation?: (conversationId: number, key: string) => Promise<void>,
+) {
   const readAppState = defineTool({
     name: "read_state",
     description:
@@ -428,6 +434,7 @@ export function createPlayground(shared: SharedState, sessionId: string, spawn: 
         result.status === "done" && result.type === "input"
           ? await api.commit((tx) => tx.entry(AssistantEntry, result.answer), ctx)
           : undefined;
+      if (answer) await autoCloseConversation?.(id as number, `subagent:${api.taskId}`).catch(() => {});
       return {
         content: [
           { type: "text", text: answer ? JSON.stringify(answer.model) : JSON.stringify(result) },

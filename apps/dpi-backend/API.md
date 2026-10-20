@@ -33,7 +33,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 | `GET /v1/sessions/:s/submissions/:id` | `?waitMs=` (≤300000) | `SendResult`, optionally long-polled |
 | `GET / POST /v1/sessions/:s/agents` | GET `?closed=1`; POST `{from?, name?}` | `AgentSummary[]` / `201 AgentSummary`; default listing hides closed agents and descendants |
 | `GET / PATCH .../agents/:a` | PATCH `{name}` or `{closed: boolean, abort?: boolean}` | `AgentDetail` (config with `readOnly`, every tool with `replay`, `writes` and `offered`, extensions) / `AgentSummary` |
-| Close/reopen behavior | `{closed:true, abort?:true}`; reopen with `{closed:false}` | Closing Main is `400 invalid`. Live work on the agent or its owned descendants returns `409 busy` unless `abort:true`; work is aborted before the closed flag is saved. The flag is a durable per-conversation document, forks start open, and closing preserves history and related resources. `AgentSummary.closed` is always present. `GET /v1/tree`, `GET /v1/sessions`, `GET /v1/sessions/:s`, and `GET .../agents` hide closed agents and descendants by default; add `?closed=1` to include them. |
+| Close/reopen behavior | `{closed:true, abort?:true}`; reopen with `{closed:false}` | Closing Main is `400 invalid`. Live work on the agent or its owned descendants returns `409 busy` unless `abort:true`; work is aborted before the closed flag is saved. The flag is a durable per-conversation document, forks start open, and closing preserves history and related resources. `AgentSummary.closed` is always present. Successful delegate and subagent calls, and ticket completion, automatically close their finished child agents when onboarding is enabled. Failed or interrupted child tasks stay open; blocked tickets leave their planner and workers open. A manual reopen survives replay of the same completion. Set `DPI_AUTOCLOSE=0` to disable this (default `1` with onboarding). `GET /v1/tree`, `GET /v1/sessions`, `GET /v1/sessions/:s`, and `GET .../agents` hide closed agents and descendants by default; add `?closed=1` to include them. |
 | `GET .../agents/:a/events` | `?docs=demo.job-runs` | agent stream |
 | `GET .../agents/:a/entries` | `?scope=all\|active&cursor=&limit=` | `{items, next}` stored history; `limit` defaults to 500 (max 2000). `scope=active` returns `{items}`, the active context, unpaged |
 | `GET .../agents/:a/transcript` | `?format=json\|markdown` | normalized transcript |
@@ -53,6 +53,10 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 ## Agent tools
 
 Every agent gets the coding tools `read`, `write`, `edit` and `bash`, plus the playground tools `read_state`, `update_state`, `list_durable_jobs`, `run_durable_job`, `check_durable_job`, `search_history`, `ping_on_call_engineer`, `subagent`, `start_session` and `handoff`. `readOnly` removes the eight that write: `bash`, `write`, `edit`, `update_state`, `run_durable_job`, `ping_on_call_engineer`, `subagent` and `start_session`. `GET .../agents/:a` lists each tool with its replay policy and whether it is offered.
+
+## Onboarding configuration
+
+`DPI_ONBOARD=1` enables onboarding extensions. `DPI_AUTOCLOSE` accepts `0` or `1`, defaults to `1` when onboarding is enabled, and disables automatic child-agent closing when set to `0`.
 
 ## Durable jobs
 

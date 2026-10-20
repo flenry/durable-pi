@@ -426,6 +426,58 @@ test("root ticket tools plan, list, update, and reject child use", async () => {
   }
 });
 
+test("ticket completion auto-closes workers and planner, while blocked tickets leave them open", async () => {
+  const makeFixture = async (shouldBlock: boolean) => {
+    let state: Record<string, unknown> = { [TICKETS_STATE_KEY]: { version: 1, tickets: {}, processedHours: [] } };
+    const current = ticket({
+      status: "in-progress",
+      runToken: "run-token",
+      runTaskId: 77,
+      pr: "https://example.invalid/pull/1",
+      plannerConversationId: 12,
+    });
+    (state[TICKETS_STATE_KEY] as { tickets: Record<string, Ticket> }).tickets[current.id] = current;
+    const closed: number[] = [];
+    const memory = {
+      call: async <T>(command: string) => {
+        if (command === "read") return { text: shouldBlock ? "" : `Ticket ${current.id}: ${current.title}. PR ${current.pr}. Goal: ${current.goal}` } as T;
+        if (shouldBlock) throw new Error("history write failed");
+        return {} as T;
+      },
+    };
+    const extension = createTicketsExtension(
+      { transactTicketState: async (change) => change(state as never) },
+      {
+        device: current.device,
+        childExtensionNames: [],
+        memory,
+        process: async () => ({ stdout: "git@github.com:acme/repo.git", stderr: "" }),
+        autoCloseConversation: async (id) => { closed.push(id); },
+      },
+    );
+    const runTask = extension.tasks?.[0] as never as { definition: { phases: { done: (task: unknown, runtime: unknown, ctx: typeof BACKGROUND_CONTEXT) => Promise<void> } } };
+    const phase = runTask.definition.phases.done;
+    const task = {
+      id: 77,
+      input: { ticketId: current.id, device: current.device, runToken: "run-token" },
+      state: { checkpoint: { phase: "done", sliceIndex: 0, children: { build: 11, qa: 13 }, checks: [], pr: current.pr } },
+    };
+    const runtime = {
+      signal: new AbortController().signal,
+      commit: async (change: () => unknown) => change(),
+    };
+    await phase(task, runtime, BACKGROUND_CONTEXT);
+    return { closed, ticket: await new TicketStore(async (change) => change(state as never)).get(current.id) };
+  };
+
+  const done = await makeFixture(false);
+  assert.equal(done.ticket?.status, "done");
+  assert.deepEqual(done.closed.sort((a, b) => a - b), [11, 12, 13]);
+  const blocked = await makeFixture(true);
+  assert.equal(blocked.ticket?.status, "blocked");
+  assert.deepEqual(blocked.closed, []);
+});
+
 test("repo validation refuses non-git, no-origin, and work-path repositories", async () => {
   const root = await mkdtemp(join(tmpdir(), "dpi-ticket-repo-"));
   try {

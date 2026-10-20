@@ -88,6 +88,7 @@ interface ExpertExtensionOptions {
   gitTimeoutMs?: number;
   maxGitOutputBytes?: number;
   nameConversation?: (conversationId: number, name: string) => void;
+  autoCloseConversation?: (conversationId: number, key: string) => Promise<void>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -330,6 +331,7 @@ async function submitToChild(
   worktreeReady: boolean,
   ctx: Context,
   git: (cwd: string, args: string[], ctx: Context) => Promise<string>,
+  autoCloseConversation?: (conversationId: number, key: string) => Promise<void>,
 ) {
   if (worktree) {
     await ensureWorktree(worktree, worktreeReady, ctx, git);
@@ -358,6 +360,7 @@ async function submitToChild(
   const answer = result.status === "done" && result.type === "input"
     ? await childAnswer(api, result.answer as number, ctx)
     : undefined;
+  if (answer) await autoCloseConversation?.(childId as number, `delegate:${api.taskId}`).catch(() => {});
   return response(
     answer
       ? `Expert ${expert} completed${worktree ? ` in ${worktree.path} (${worktree.branch})` : ""}.\n\n${answer}`
@@ -407,6 +410,7 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
           existing.identity.worktreeReady,
           ctx,
           git,
+          options.autoCloseConversation,
         );
       }
 
@@ -460,6 +464,7 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
         created.identity.worktreeReady,
         ctx,
         git,
+        options.autoCloseConversation,
       );
     },
   });

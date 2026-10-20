@@ -7,6 +7,7 @@
 //   DPI_SKILLS_EXCLUDE  comma list of skills not offered to durable agents
 //   DPI_MAX_CHILDREN    live delegate children allowed per session (default 2)
 //   DPI_TICKETS         1 enables the durable hourly ticket scheduler (default 0)
+//   DPI_AUTOCLOSE       0 disables automatic close of completed child agents (default 1 with onboarding)
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +25,7 @@ export interface OnboardOptions {
   skillsExclude: string[];
   maxChildren: number;
   ticketScheduler?: boolean;
+  autoClose?: boolean;
 }
 
 /** Skills that drive pi-only machinery (Herdr, worktree workers, pi's own handoff). */
@@ -41,6 +43,8 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
     throw Error(`DPI_MAX_CHILDREN must be a positive safe integer; got ${maxChildrenText}`);
   const ticketFlag = env.DPI_TICKETS ?? "0";
   if (ticketFlag !== "0" && ticketFlag !== "1") throw Error(`DPI_TICKETS must be 0 or 1; got ${ticketFlag}`);
+  const autoCloseFlag = env.DPI_AUTOCLOSE ?? "1";
+  if (autoCloseFlag !== "0" && autoCloseFlag !== "1") throw Error(`DPI_AUTOCLOSE must be 0 or 1; got ${autoCloseFlag}`);
   const setupDir = env.PI_SETUP_DIR ?? "~/.pi";
   if (!setupDir.trim()) throw Error("PI_SETUP_DIR must not be empty");
   const expand = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -54,5 +58,6 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
       .filter(Boolean),
     maxChildren,
     ticketScheduler: ticketFlag === "1",
+    autoClose: autoCloseFlag === "1",
   };
 }

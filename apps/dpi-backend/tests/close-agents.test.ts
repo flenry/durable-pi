@@ -6,7 +6,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineTask } from "@earendil-works/pi-durable";
 import { DpiError } from "../../dpi-sdk/src/errors.js";
 import { bootServer, faux, newToken, tempStore, until } from "./helpers.js";
-import { Store } from "../src/store.js";
+import { Store, type SessionRow } from "../src/store.js";
 
 const HoldingTask = defineTask<{}, { phase: "hold" }, { done: true }>({
   name: "test.close-holding-task",
@@ -75,6 +75,124 @@ test("agent close persists, hides descendants, and forks start open", async () =
     assert.equal(persisted.find((agent) => agent.id === fork.id)?.closed, false);
   } finally {
     await server.stop();
+    await temp.cleanup();
+  }
+});
+
+test("built-in subagent auto-closes after its successful result when enabled", async () => {
+  const temp = await tempStore();
+  const previous = { DPI_ONBOARD: process.env.DPI_ONBOARD, DPI_MEMORY: process.env.DPI_MEMORY, DPI_TICKETS: process.env.DPI_TICKETS, DPI_AUTOCLOSE: process.env.DPI_AUTOCLOSE };
+  let store: Store | undefined;
+  let ownerTaskId: number | undefined;
+  try {
+    process.env.DPI_ONBOARD = "1";
+    process.env.DPI_MEMORY = "off";
+    process.env.DPI_TICKETS = "0";
+    process.env.DPI_AUTOCLOSE = "1";
+    store = await temp.open();
+    const session = await store.create({ name: "Subagent close", cwd: temp.work, model: faux });
+    const { row, h, c } = await store.resolveAgent(session.id, "main");
+    ownerTaskId = await c.commit((tx) => tx.createTask(HoldingTask, {}, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT) as number;
+    const agent = await c.agent(BACKGROUND_CONTEXT);
+    const tool = agent.extensions.flatMap((extension) => extension.tools ?? []).find((candidate) => candidate.name === "subagent");
+    assert.ok(tool);
+    await tool.execute({ task: "Return a short answer." } as never, {
+      taskId: ownerTaskId,
+      conversationId: c.id,
+      callId: "subagent-close-test",
+      agent: (ctx: typeof BACKGROUND_CONTEXT) => c.agent(ctx),
+      registry: { extension: () => undefined },
+      commit: (change: (tx: unknown) => unknown, ctx: typeof BACKGROUND_CONTEXT) => c.commit(change as never, ctx),
+      details: async () => {},
+      conversation: (id: number, ctx: typeof BACKGROUND_CONTEXT) => h.conversation(id as never, ctx),
+    } as never, BACKGROUND_CONTEXT);
+    const child = (await store.agents(row, undefined, true)).find((candidate) => candidate.ownerTaskId === ownerTaskId);
+    assert.ok(child);
+    assert.equal(child.closed, true);
+  } finally {
+    if (store && ownerTaskId !== undefined) {
+      const firstSession = store.list()[0];
+      if (firstSession) await store.abortTask(store.harness(firstSession), ownerTaskId).catch(() => {});
+    }
+    await store?.close();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await temp.cleanup();
+  }
+});
+
+test("DPI_AUTOCLOSE=0 leaves a successful built-in subagent open", async () => {
+  const temp = await tempStore();
+  const previous = { DPI_ONBOARD: process.env.DPI_ONBOARD, DPI_MEMORY: process.env.DPI_MEMORY, DPI_TICKETS: process.env.DPI_TICKETS, DPI_AUTOCLOSE: process.env.DPI_AUTOCLOSE };
+  let store: Store | undefined;
+  try {
+    process.env.DPI_ONBOARD = "1";
+    process.env.DPI_MEMORY = "off";
+    process.env.DPI_TICKETS = "0";
+    process.env.DPI_AUTOCLOSE = "0";
+    store = await temp.open();
+    const session = await store.create({ name: "Subagent left open", cwd: temp.work, model: faux });
+    const { row, h, c } = await store.resolveAgent(session.id, "main");
+    const ownerTaskId = await c.commit((tx) => tx.createTask(HoldingTask, {}, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT) as number;
+    const agent = await c.agent(BACKGROUND_CONTEXT);
+    const tool = agent.extensions.flatMap((extension) => extension.tools ?? []).find((candidate) => candidate.name === "subagent");
+    assert.ok(tool);
+    await tool.execute({ task: "Return a short answer." } as never, {
+      taskId: ownerTaskId,
+      conversationId: c.id,
+      callId: "subagent-autoclose-disabled",
+      agent: (ctx: typeof BACKGROUND_CONTEXT) => c.agent(ctx),
+      registry: { extension: () => undefined },
+      commit: (change: (tx: unknown) => unknown, ctx: typeof BACKGROUND_CONTEXT) => c.commit(change as never, ctx),
+      details: async () => {},
+      conversation: (id: number, ctx: typeof BACKGROUND_CONTEXT) => h.conversation(id as never, ctx),
+    } as never, BACKGROUND_CONTEXT);
+    const child = (await store.agents(row, undefined, true)).find((candidate) => candidate.ownerTaskId === ownerTaskId);
+    assert.ok(child);
+    assert.equal(child.closed, false);
+    await store.abortTask(h, ownerTaskId).catch(() => {});
+  } finally {
+    await store?.close();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await temp.cleanup();
+  }
+});
+
+test("auto-close is one-shot across manual reopen and backend restart", async () => {
+  const temp = await tempStore();
+  const previous = { DPI_ONBOARD: process.env.DPI_ONBOARD, DPI_MEMORY: process.env.DPI_MEMORY, DPI_TICKETS: process.env.DPI_TICKETS, DPI_AUTOCLOSE: process.env.DPI_AUTOCLOSE };
+  let store: Store | undefined;
+  try {
+    process.env.DPI_ONBOARD = "1";
+    process.env.DPI_MEMORY = "off";
+    process.env.DPI_TICKETS = "0";
+    process.env.DPI_AUTOCLOSE = "1";
+    store = await temp.open();
+    const session = await store.create({ name: "Auto close", cwd: temp.work, model: faux });
+    const { row } = await store.resolveAgent(session.id, "main");
+    const child = await store.createAgent(row, { name: "Finished child" });
+    const autoClose = (store as unknown as { autoCloseConversation(row: SessionRow, id: number, key: string): Promise<void> }).autoCloseConversation.bind(store);
+    await autoClose(row, child.id, "delegate:task-1");
+    assert.equal((await store.agentSummary(row, (await store.resolveAgent(session.id, String(child.id))).c)).closed, true);
+    const { c: childConversation } = await store.resolveAgent(session.id, String(child.id));
+    await store.setAgentClosed(row, childConversation, false);
+    await store.close();
+    store = await temp.open();
+    const reopened = await store.resolveAgent(session.id, String(child.id));
+    const replayAutoClose = (store as unknown as { autoCloseConversation(row: SessionRow, id: number, key: string): Promise<void> }).autoCloseConversation.bind(store);
+    await replayAutoClose(store.row(session.id), child.id, "delegate:task-1");
+    assert.equal((await store.agentSummary(store.row(session.id), reopened.c)).closed, false);
+  } finally {
+    await store?.close();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     await temp.cleanup();
   }
 });
