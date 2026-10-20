@@ -1,10 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { Network, PanelLeftClose, PanelLeftOpen } from "lucide-vue-next";
 import DeviceIcon from "./DeviceIcon.vue";
-import type { TreeNode } from "@sdk/models";
+import type { DeviceTree } from "@sdk/api";
+import { networkTree, type TreeNode } from "@sdk/models";
 import TreeRow from "./TreeRow.vue";
-import { deviceClient, hub } from "../client/hub";
+import { deviceClient, hub, message } from "../client/hub";
+import {
+  isBusyCloseError,
+  mergeClosedAgents,
+  parentAfterClosing,
+} from "../client/agent-close";
 import {
   attempt,
   expanded,
@@ -16,6 +22,8 @@ import {
   toggle,
   ui,
   panelKeys,
+  sessionAgents,
+  showClosedAgents,
 } from "../client/store";
 
 interface Row {
@@ -24,6 +32,26 @@ interface Row {
   parent?: string;
 }
 
+const closedTrees = ref(new Map<string, DeviceTree>());
+const pendingAgents = ref(new Set<string>());
+const displayTree = computed(() =>
+  networkTree(
+    network.devices.value.map((device) => {
+      const all = closedTrees.value.get(device.id);
+      if (!showClosedAgents.value || !all) return device;
+      const live = device.tree;
+      const sessions = live
+        ? live.sessions.map((session) => {
+            const snapshot = all.sessions.find((candidate) => candidate.id === session.id);
+            return snapshot
+              ? { ...session, agents: mergeClosedAgents(snapshot.agents, session.agents) }
+              : session;
+          })
+        : all.sessions;
+      return { ...device, tree: { ...all, ...live, sessions } };
+    }),
+  ),
+);
 const rows = computed(() => {
   const out: Row[] = [];
   const walk = (nodes: TreeNode[], depth: number, parent?: string) => {
@@ -33,7 +61,7 @@ const rows = computed(() => {
         walk(node.children, depth + 1, node.key);
     }
   };
-  walk(network.tree.value, 0);
+  walk(displayTree.value, 0);
   return out;
 });
 const focusKey = ref<string>();
@@ -44,6 +72,40 @@ const deviceOf = (node: TreeNode) =>
     (d) => d.id === (node.type === "device" ? node.device.id : node.deviceId),
   );
 const isOnline = (node: TreeNode) => deviceOf(node)?.status === "online";
+const deviceStates = computed(() =>
+  network.devices.value.map((device) => `${device.id}:${device.status}`).join("|"),
+);
+
+async function refreshTree(
+  deviceId: string,
+  includeClosed = showClosedAgents.value,
+  forceDefault = false,
+) {
+  const tree = await deviceClient(deviceId).tree({ closed: includeClosed });
+  if (!forceDefault && showClosedAgents.value !== includeClosed) return;
+  if (includeClosed) {
+    closedTrees.value = new Map(closedTrees.value).set(deviceId, tree);
+  } else {
+    network.model.apply({
+      type: "network",
+      devices: network.devices.value.map((device) =>
+        device.id === deviceId ? { ...device, tree } : device,
+      ),
+    });
+  }
+}
+
+watch(
+  [showClosedAgents, deviceStates],
+  ([includeClosed]) => {
+    if (!includeClosed) closedTrees.value = new Map();
+    for (const device of network.devices.value)
+      if (device.status === "online")
+        void refreshTree(device.id, includeClosed).catch((error) => (ui.error = message(error)));
+  },
+  { immediate: true },
+);
+
 const isSelected = (node: TreeNode) =>
   node.type === "agent" &&
   selected.value?.deviceId === node.deviceId &&
@@ -58,6 +120,43 @@ function activate(node: TreeNode) {
   const root = node.session.agents.find((a) => a.kind === "root") ?? node.session.agents[0];
   toggle(node.key, true);
   if (root) select({ deviceId: node.deviceId, sessionId: node.session.id, agentId: root.id });
+}
+
+function fallBackFromClosedBranch(node: Extract<TreeNode, { type: "agent" }>) {
+  const target = selected.value;
+  if (
+    !target ||
+    target.deviceId !== node.deviceId ||
+    target.sessionId !== node.sessionId
+  )
+    return;
+  const agents = sessionAgents.value;
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  const seen = new Set<number>();
+  let current = byId.get(target.agentId);
+  let affected = false;
+  while (current && !seen.has(current.id)) {
+    if (current.id === node.agent.id) {
+      affected = true;
+      break;
+    }
+    seen.add(current.id);
+    const parent = current.parentId ?? current.ownerAgentId;
+    current = parent === undefined ? undefined : byId.get(parent);
+  }
+  if (!affected) return;
+  const parent = parentAfterClosing(agents, target.agentId, node.agent.id);
+  select(parent === undefined ? undefined : { ...target, agentId: parent });
+}
+
+async function refreshAfterMutation(deviceId: string) {
+  try {
+    // Refresh the default tree first so a reopened agent is present before merging a closed-inclusive snapshot.
+    await refreshTree(deviceId, false, true);
+    if (showClosedAgents.value) await refreshTree(deviceId, true);
+  } catch (error) {
+    ui.error = `Agent updated, but refreshing the tree failed: ${message(error)}`;
+  }
 }
 
 async function action(node: TreeNode, name: string) {
@@ -101,6 +200,38 @@ async function action(node: TreeNode, name: string) {
     return;
   }
   const a = node.agent;
+  if (name === "close" || name === "reopen") {
+    if (pendingAgents.value.has(node.key)) return;
+    pendingAgents.value = new Set(pendingAgents.value).add(node.key);
+    ui.error = "";
+    const handle = client.agent(node.sessionId, a.id);
+    const closed = name === "close";
+    try {
+      await handle.setClosed(closed);
+      if (closed) fallBackFromClosedBranch(node);
+      await refreshAfterMutation(device.id);
+    } catch (error) {
+      if (closed && isBusyCloseError(error)) {
+        ui.dialog = {
+          kind: "prompt",
+          title: "Stop and close?",
+          hint: `${a.name} or one of its owned agents is still working. Stop the work and close this agent?`,
+          submit: "Stop and close",
+          danger: true,
+          run: async () => {
+            await handle.setClosed(true, { abort: true });
+            fallBackFromClosedBranch(node);
+            await refreshAfterMutation(device.id);
+          },
+        };
+      } else ui.error = message(error);
+    } finally {
+      const pending = new Set(pendingAgents.value);
+      pending.delete(node.key);
+      pendingAgents.value = pending;
+    }
+    return;
+  }
   if (name === "rename")
     ui.dialog = {
       kind: "prompt",
@@ -155,6 +286,10 @@ function keydown(e: KeyboardEvent) {
     <template v-if="layout.tree || ui.drawer">
       <header class="tree-head">
         <span><Network :size="16" />NETWORK</span>
+        <label class="show-closed-toggle">
+          <input v-model="showClosedAgents" type="checkbox" />
+          Show closed
+        </label>
         <button
           class="icon-button panel-toggle"
           aria-label="Collapse network"
@@ -182,6 +317,7 @@ function keydown(e: KeyboardEvent) {
           :selected="isSelected(row.node)"
           :focused="focusKey === row.node.key"
           :online="isOnline(row.node)"
+          :action-busy="pendingAgents.has(row.node.key)"
           @toggle="toggle(row.node.key)"
           @activate="activate(row.node)"
           @action="action(row.node, $event)"

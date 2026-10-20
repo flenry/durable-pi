@@ -144,6 +144,21 @@
   align-items: center;
   gap: 8px;
 }
+.show-closed-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.show-closed-toggle input {
+  accent-color: var(--accent);
+  margin: 0;
+}
 .tree-list {
   flex: 1;
   overflow: auto;
@@ -254,7 +269,8 @@
   border-radius: 6px;
 }
 .tree-row:hover .acts,
-.tree-row.focus .acts {
+.tree-row.focus .acts,
+.tree-row:focus-within .acts {
   display: inline-flex;
 }
 .tree-row:hover .acts ~ *,
@@ -265,6 +281,24 @@
 .tree-row .acts .icon-button:disabled {
   opacity: 0.35;
   background: none;
+}
+.tree-row .acts .danger-action:hover {
+  color: #ff8a80;
+}
+.tree-row .acts .reopen-action {
+  color: #8bd4a6;
+}
+.tree-row .acts .icon-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  z-index: 1;
+}
+.tree-row.agent.closed {
+  opacity: 0.52;
+}
+.tree-row.agent.closed:hover,
+.tree-row.agent.closed.sel {
+  opacity: 0.78;
 }
 .tree-row .bg-count {
   display: inline-flex;
@@ -571,6 +605,13 @@
   }
 }
 @media (max-width: 760px) {
+  .tree-row.agent .acts {
+    display: inline-flex;
+  }
+  .tree-row.agent .acts .icon-button {
+    width: 34px;
+    height: 34px;
+  }
   .tree-resizer {
     display: none;
   }

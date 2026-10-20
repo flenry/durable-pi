@@ -4,6 +4,7 @@ import { computed, reactive, ref, shallowRef, watch } from "vue";
 import type { AgentDetail, ModelInfo, NetworkDevice, TaskNode } from "@sdk/api";
 import { sumUsage } from "@sdk/transcript";
 import { lineage } from "@sdk/models";
+import { parentAfterDisappearance } from "./agent-close";
 import { HubStream } from "./stream";
 import { deviceClient, hub, message } from "./hub";
 import { useAgent, useDevice, useNetwork, useSession, type AgentTarget } from "./composables";
@@ -19,6 +20,7 @@ export const configFile = ref<string>();
 export const selected = ref<AgentTarget>();
 export const expanded = ref(new Set<string>());
 export const treeWidth = ref(300);
+export const showClosedAgents = ref(false);
 /** Which side panels are expanded (persisted). Collapsed panels shrink to an icon rail. */
 export const layout = reactive({ tree: true, inspector: true });
 const uiLoaded = ref(false);
@@ -108,18 +110,21 @@ watch(
   (v) => uiLoaded.value && void hub.uiSet("tree.selected", v ?? null).catch(() => {}),
 );
 watch(treeWidth, (v) => uiLoaded.value && saveLater("tree.width", v));
+watch(showClosedAgents, (v) => uiLoaded.value && saveLater("tree.showClosedAgents", v));
 watch(layout, (v) => uiLoaded.value && saveLater("layout.panels", { ...v }));
 
 export async function boot() {
   stream.start();
   try {
-    const [net, sel, width, panels] = await Promise.all([
+    const [net, sel, width, panels, closedAgents] = await Promise.all([
       hub.network(),
       hub.uiGet<AgentTarget>("tree.selected"),
       hub.uiGet<number>("tree.width"),
       hub.uiGet<{ tree: boolean; inspector: boolean }>("layout.panels"),
+      hub.uiGet<boolean>("tree.showClosedAgents"),
     ]);
     if (panels) Object.assign(layout, panels);
+    if (typeof closedAgents === "boolean") showClosedAgents.value = closedAgents;
     configFile.value = net.configFile;
     if (!network.model.devices.length)
       network.model.apply({ type: "network", devices: net.devices });
@@ -162,6 +167,21 @@ export const sessionAgents = computed(() =>
   session.state.value.agents.length
     ? session.state.value.agents
     : (sessionSummary.value?.agents ?? []),
+);
+watch(
+  () => session.state.value,
+  (next, previous) => {
+    const target = selected.value;
+    if (!target || !previous.ready || !next.ready) return;
+    if (!previous.agents.some((agent) => agent.id === target.agentId)) return;
+    if (next.agents.some((agent) => agent.id === target.agentId)) return;
+    const parent = parentAfterDisappearance(
+      previous.agents,
+      target.agentId,
+      new Set(next.agents.map((agent) => agent.id)),
+    );
+    select(parent === undefined ? undefined : { ...target, agentId: parent });
+  },
 );
 export const agentSummary = computed(() =>
   sessionAgents.value.find((a) => a.id === selected.value?.agentId),

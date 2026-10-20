@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent close component test</title>
+    <link rel="stylesheet" href="/src/style.css" />
+    <link rel="stylesheet" href="/src/network.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      import { createApp, h } from "vue";
+      import NetworkSidebar from "/src/components/NetworkSidebar.vue";
+      import PromptDialog from "/src/components/PromptDialog.vue";
+      import { network, selected, ui, expanded } from "/src/client/store";
+
+      const agents = [
+        { id: 1, name: "Main", named: false, kind: "root", busy: false, background: 0, closed: false },
+        { id: 2, name: "Worker", named: true, kind: "subagent", ownerAgentId: 1, busy: false, background: 0, closed: false },
+      ];
+      const session = {
+        id: "close-test", name: "Close test", cwd: "/tmp", model: "test", createdAt: 1,
+        dbPath: "/tmp/session.db", busy: false, agents,
+      };
+      network.model.apply({ type: "network", devices: [{
+        id: "local", name: "Local", kind: "local", url: "http://127.0.0.1:43123",
+        source: "config", hasToken: true, status: "online",
+        tree: { uid: "device-uid", name: "Local", at: 1, sessions: [session] },
+      }] });
+      selected.value = { deviceId: "local", sessionId: session.id, agentId: 2 };
+      expanded.value = new Set(["local", "local/s/close-test", "local/s/close-test/a/1"]);
+      window.__agentCloseState = { ui, selected };
+      createApp({
+        render() {
+          return h("div", [h(NetworkSidebar), ui.dialog?.kind === "prompt"
+            ? h(PromptDialog, { key: ui.dialog.title, dialog: ui.dialog, onClose: () => (ui.dialog = undefined) })
+            : null]);
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>

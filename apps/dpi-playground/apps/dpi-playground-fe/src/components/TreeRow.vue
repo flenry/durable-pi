@@ -11,6 +11,8 @@ import {
   Plus,
   RefreshCw,
   Archive,
+  RotateCcw,
+  X,
 } from "lucide-vue-next";
 import DeviceIcon from "./DeviceIcon.vue";
 import type { TreeNode } from "@sdk/models";
@@ -23,6 +25,7 @@ const props = defineProps<{
   selected: boolean;
   focused: boolean;
   online: boolean;
+  actionBusy?: boolean;
 }>();
 const emit = defineEmits<{ toggle: []; activate: []; action: [name: string] }>();
 
@@ -76,7 +79,7 @@ const title = computed(() => {
 <template>
   <div
     class="tree-row"
-    :class="[node.type, { sel: selected, focus: focused, stale: node.stale }]"
+    :class="[node.type, { sel: selected, focus: focused, stale: node.stale, closed: agent?.closed }]"
     :style="{ '--depth': depth }"
     role="treeitem"
     :aria-level="depth + 1"
@@ -172,12 +175,32 @@ const title = computed(() => {
       <span class="acts" @click.stop>
         <button
           class="icon-button"
-          :disabled="!online"
+          :disabled="!online || actionBusy"
           :aria-label="`Rename agent ${label}`"
           title="Rename agent"
           @click="emit('action', 'rename')"
         >
           <Pencil :size="16" />
+        </button>
+        <button
+          v-if="agent.kind !== 'root' && !agent.closed"
+          class="icon-button danger-action"
+          :disabled="!online || actionBusy"
+          :aria-label="`Close agent ${label}`"
+          title="Close agent"
+          @click="emit('action', 'close')"
+        >
+          <X :size="16" />
+        </button>
+        <button
+          v-else-if="agent.kind !== 'root' && agent.closed"
+          class="icon-button reopen-action"
+          :disabled="!online || actionBusy"
+          :aria-label="`Reopen agent ${label}`"
+          title="Reopen agent"
+          @click="emit('action', 'reopen')"
+        >
+          <RotateCcw :size="16" />
         </button>
       </span>
     </template>
