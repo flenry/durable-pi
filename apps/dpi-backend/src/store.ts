@@ -212,6 +212,8 @@ export interface StoreOptions {
   provider: "openrouter" | "faux" | "subscription";
   /** pi auth.json for provider "subscription"; defaults to ~/.pi/agent/auth.json. */
   authFile?: string;
+  /** Test seam for simulating a crash after reminder input admission and before its fired marker commit. */
+  afterReminderWakeSubmit?: (reminderId: string) => void | Promise<void>;
 }
 
 /** Agent documents a client may read or stream, by kind. */
@@ -733,6 +735,7 @@ export class Store {
             device: this.name,
             nameConversation: (conversationId, name) => this.setAgentName(row, conversationId, name),
             abortTask: (taskId) => this.abortTask(this.harness(row), taskId),
+            afterReminderWakeSubmit: this.options.afterReminderWakeSubmit,
             autoCloseConversation,
           })
         : [];

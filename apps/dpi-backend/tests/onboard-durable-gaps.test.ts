@@ -464,12 +464,57 @@ function reminderResponder(requests: Map<string, { when: number; message: string
   };
 }
 
+test("handoff starts one continuation run with its note and deduplicates the continuation request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-handoff-wake-"));
+  const startDir = join(root, "projects");
+  await mkdir(startDir, { recursive: true });
+  const env = { DPI_ONBOARD: undefined, DPI_TICKETS: "0" };
+  let store: Store | undefined;
+  try {
+    await withEnvironment(env, async () => {
+      store = await Store.open(storeOptions(root, startDir));
+      const prompts: string[] = [];
+      installFakeModel(store, ({ prompt }) => {
+        prompts.push(prompt);
+        if (prompt === "request-handoff")
+          return fauxAssistantMessage([fauxToolCall("handoff", { note: "resume checking CI" })], { stopReason: "toolUse" });
+        return fauxAssistantMessage("Continued.");
+      });
+      const session = await store.create({ name: "Handoff wake fixture", cwd: startDir, model: { provider: "faux", modelId: "echo" } });
+      const { h, c } = await store.resolveAgent(session.id, "main");
+      const sent = await store.send(session.id, c, { content: "request-handoff", requestId: "request-handoff" });
+      assert.equal((await store.settled(h, sent.id as number, 20_000)).status, "done");
+      await waitUntil(async () => prompts.some((prompt) => prompt.includes("Continue after handoff: resume checking CI")), 10_000, "handoff continuation run");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.equal(prompts.filter((prompt) => prompt.includes("Continue after handoff: resume checking CI")).length, 1,
+        "one handoff call starts exactly one continuation run");
+      assert.equal(prompts.filter((prompt) => prompt.includes("Continue after handoff: resume checking CI")).length, 1,
+        "no second continuation run is started");
+    });
+  } finally {
+    await store?.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("reminders fire once through the durable timer after Store restart and cancellation survives restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "dpi-reminder-recovery-"));
   const setupDir = await writeMemoryCliFixture(root);
   const startDir = join(root, "projects");
   await mkdir(startDir, { recursive: true });
-  const options = storeOptions(root, startDir);
+  let crashAfterWakeSubmit = false;
+  let closeAfterWakeSubmit: Promise<void> | undefined;
+  let notifyWakeSubmitted!: () => void;
+  const wakeSubmitted = new Promise<void>((resolve) => { notifyWakeSubmitted = resolve; });
+  const options = {
+    ...storeOptions(root, startDir),
+    afterReminderWakeSubmit: () => {
+      if (!crashAfterWakeSubmit) return;
+      crashAfterWakeSubmit = false;
+      notifyWakeSubmitted();
+      closeAfterWakeSubmit = store!.close();
+    },
+  };
   const requests = new Map<string, { when: number; message: string }>();
   const prompts: string[] = [];
   const responder = reminderResponder(requests, prompts);
@@ -494,12 +539,25 @@ test("reminders fire once through the durable timer after Store restart and canc
       store = await Store.open(options);
       installFakeModel(store, responder);
       assert.ok(Date.now() < fireAt, "the Store reopens before the reminder is due");
-      await waitUntil(async () => (await reminderEvents(store!, session.id, fireInput.id)).length === 1, 12_000, "reminder firing after restart");
+      crashAfterWakeSubmit = true;
+      await withTimeout(wakeSubmitted, 12_000, "wake input admission before simulated crash");
+      await closeAfterWakeSubmit;
+      store = undefined;
+      crashAfterWakeSubmit = false;
+      store = await Store.open(options);
+      installFakeModel(store, responder);
+      assert.equal((await reminderEvents(store, session.id, fireInput.id)).length, 0,
+        "the injected crash occurs before the fired event is committed");
+      await waitUntil(async () => (await reminderEvents(store!, session.id, fireInput.id)).length === 1, 12_000, "reminder firing after crash recovery");
       const reopenedRow = store.row(session.id);
       h = store.harness(reopenedRow);
       await waitUntil(async () => (await h.getTask(fireTask.id, context))?.state.status === "terminal", 5_000, "fired reminder task to finish");
       const fired = await reminderEvents(store, session.id, fireInput.id);
       assert.equal(fired.length, 1, "the reminder appends one firing entry");
+      const wakeSubmission = await h.commit(
+        (tx) => tx.submissionByRequest(ROOT_CONVERSATION_ID, `dpi-reminder:${fireInput.id}`), context,
+      );
+      assert.ok(wakeSubmission, "replay reuses the one durable wake submission");
       await waitUntil(async () => prompts.some((prompt) => prompt.includes("⏰ Reminder: fire after restart")), 5_000, "reminder input to wake the agent");
       assert.equal((fired[0].data as { text?: string } | undefined)?.text, "fire after restart");
       assert.match(toMarkdown(toTranscript([fired[0] as unknown as WireEntry])), /fire after restart/,

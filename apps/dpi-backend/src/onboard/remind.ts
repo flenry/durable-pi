@@ -46,7 +46,11 @@ export function parseReminderWhen(value: string, now = Date.now()): number {
   return timestamp;
 }
 
-function createReminderTask(now: () => number, timer?: (deadline: number, signal?: AbortSignal) => Promise<void>) {
+function createReminderTask(
+  now: () => number,
+  timer?: (deadline: number, signal?: AbortSignal) => Promise<void>,
+  afterWakeSubmit?: (reminderId: string) => void | Promise<void>,
+) {
   return defineTask<ReminderInput, ReminderCheckpoint, ReminderResult>({
     name: "dpi.reminder",
     version: 1,
@@ -55,29 +59,34 @@ function createReminderTask(now: () => number, timer?: (deadline: number, signal
       wait: async (task, runtime, ctx) => {
         if (timer) await timer(task.input.when, runtime.signal);
         else await runtime.sleep(task.input.when, ctx);
+        const item = (await runtime.snapshot(ReminderState, task.conversationId, ctx))?.items[task.input.id];
+        if (!item || item.status !== "pending") {
+          await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { id: task.input.id, fired: false } } }), ctx);
+          return;
+        }
+        const conversation = await runtime.conversation(task.conversationId, ctx);
+        if (!conversation) throw new Error("Reminder conversation is unavailable");
+        // Admit the stable request before marking fired: a replay after a crash deduplicates the submission.
+        await conversation.submit({
+          type: "input",
+          content: `⏰ Reminder: ${item.message}`,
+          whenBusy: "followUp",
+          requestId: `dpi-reminder:${item.id}`,
+        }, ctx);
+        await afterWakeSubmit?.(item.id);
         await runtime.commit(async (tx) => {
           const reminders = await tx.doc(ReminderState, task.conversationId);
-          const item = reminders.items[task.input.id];
-          if (!item || item.status !== "pending")
+          const current = reminders.items[task.input.id];
+          if (!current || current.status !== "pending")
             return { status: "terminal", outcome: { status: "completed", result: { id: task.input.id, fired: false } } };
-          item.status = "fired";
-          item.firedAt = now();
+          current.status = "fired";
+          current.firedAt = now();
           await tx.appendEntry(task.conversationId, {
             kind: "dpi.reminder",
-            data: { id: item.id, message: item.message, text: item.message, scheduledAt: item.when, firedAt: item.firedAt },
+            data: { id: current.id, message: current.message, text: current.message, scheduledAt: current.when, firedAt: current.firedAt },
           });
-          return { status: "terminal", outcome: { status: "completed", result: { id: item.id, fired: true } } };
+          return { status: "terminal", outcome: { status: "completed", result: { id: current.id, fired: true } } };
         }, ctx);
-        const item = (await runtime.snapshot(ReminderState, task.conversationId, ctx))?.items[task.input.id];
-        if (item?.status === "fired") {
-          const conversation = await runtime.conversation(task.conversationId, ctx);
-          await conversation?.submit({
-            type: "input",
-            content: `⏰ Reminder: ${item.message}`,
-            whenBusy: "followUp",
-            requestId: `dpi-reminder:${item.id}`,
-          }, ctx);
-        }
       },
     },
     abort: async (task, runtime, ctx) => {
@@ -99,9 +108,10 @@ export function createRemindExtension(options: {
   now?: () => number;
   timer?: (deadline: number, signal?: AbortSignal) => Promise<void>;
   abortTask?: (taskId: number) => Promise<unknown>;
+  afterWakeSubmit?: (reminderId: string) => void | Promise<void>;
 } = {}) {
   const now = options.now ?? Date.now;
-  const reminderTask = createReminderTask(now, options.timer);
+  const reminderTask = createReminderTask(now, options.timer, options.afterWakeSubmit);
 
   const remind = defineTool({
     name: "remind",

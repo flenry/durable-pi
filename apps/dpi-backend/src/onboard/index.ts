@@ -20,6 +20,7 @@ export interface OnboardInstallContext {
   device: string;
   nameConversation: (conversationId: number, name: string) => void;
   abortTask: (taskId: number) => Promise<unknown>;
+  afterReminderWakeSubmit?: (reminderId: string) => void | Promise<void>;
   autoCloseConversation?: (conversationId: number, key: string) => Promise<void>;
 }
 
@@ -49,7 +50,7 @@ export function installOnboard(registry: Registry, options: OnboardOptions, cont
       nameConversation: context.nameConversation,
       autoCloseConversation: context.autoCloseConversation,
     }),
-    createRemindExtension({ abortTask: context.abortTask }),
+    createRemindExtension({ abortTask: context.abortTask, afterWakeSubmit: context.afterReminderWakeSubmit }),
   ];
   for (const extension of extensions) registry.install(extension);
   return extensions;
