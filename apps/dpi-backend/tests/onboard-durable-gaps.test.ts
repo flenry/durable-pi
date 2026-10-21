@@ -446,8 +446,9 @@ async function reminderEvents(store: Store, sessionId: string, reminderId: strin
   return page.items.filter((entry) => entry.kind === "dpi.reminder" && (entry.data as { id?: string } | undefined)?.id === reminderId);
 }
 
-function reminderResponder(requests: Map<string, { when: number; message: string }>): ModelResponder {
+function reminderResponder(requests: Map<string, { when: number; message: string }>, prompts: string[] = []): ModelResponder {
   return ({ prompt, afterToolResult }) => {
+    prompts.push(prompt);
     if (!afterToolResult && prompt.startsWith("schedule-reminder:")) {
       const request = requests.get(prompt);
       assert.ok(request, `test reminder request is configured: ${prompt}`);
@@ -470,7 +471,8 @@ test("reminders fire once through the durable timer after Store restart and canc
   await mkdir(startDir, { recursive: true });
   const options = storeOptions(root, startDir);
   const requests = new Map<string, { when: number; message: string }>();
-  const responder = reminderResponder(requests);
+  const prompts: string[] = [];
+  const responder = reminderResponder(requests, prompts);
   const env = { DPI_ONBOARD: "1", DPI_MEMORY: "local", DPI_TICKETS: "0", PI_SETUP_DIR: setupDir };
   let store: Store | undefined;
   try {
@@ -498,6 +500,7 @@ test("reminders fire once through the durable timer after Store restart and canc
       await waitUntil(async () => (await h.getTask(fireTask.id, context))?.state.status === "terminal", 5_000, "fired reminder task to finish");
       const fired = await reminderEvents(store, session.id, fireInput.id);
       assert.equal(fired.length, 1, "the reminder appends one firing entry");
+      await waitUntil(async () => prompts.some((prompt) => prompt.includes("⏰ Reminder: fire after restart")), 5_000, "reminder input to wake the agent");
       assert.equal((fired[0].data as { text?: string } | undefined)?.text, "fire after restart");
       assert.match(toMarkdown(toTranscript([fired[0] as unknown as WireEntry])), /fire after restart/,
         "ordinary transcript rendering must display the fired reminder message");

@@ -493,10 +493,19 @@ export function createPlayground(
     description:
       "Start a fresh model context with a concise handoff note. Old transcript stays stored.",
     parameters: Type.Object({ note: Type.String() }),
-    execute: async (args) => ({
-      content: [{ type: "text", text: "Context handed off." }],
-      control: { handoff: args.note },
-    }),
+    execute: async (args, api, ctx) => {
+      const conversation = await api.conversation(api.conversationId, ctx);
+      await conversation?.submit({
+        type: "input",
+        content: `Continue after handoff: ${args.note}`,
+        whenBusy: "followUp",
+        requestId: `dpi-handoff:${api.taskId}:${api.callId}`,
+      }, ctx);
+      return {
+        content: [{ type: "text", text: "Context handed off." }],
+        control: { handoff: args.note },
+      };
+    },
   });
   return defineExtension({
     name: "playground",

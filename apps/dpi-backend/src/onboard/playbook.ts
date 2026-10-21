@@ -10,7 +10,7 @@ Use a tier-shaped pipeline: a build expert implements first, QA verifies the res
 
 ## Durable tickets and reminders
 
-Use add_ticket to plan unattended repository work; clarify one question at a time before the ticket becomes ready. Use list_tickets, run_ticket, and update_ticket to manage the device queue. A ticket run opens a pull request and never merges it; blocked work must state the exact action needed. Use remind, list_reminders, and cancel_reminder for one-shot durable reminders.`;
+Use add_ticket to plan unattended repository work; clarify one question at a time before the ticket becomes ready. Use list_tickets, run_ticket, and update_ticket to manage the device queue. A ticket run opens a pull request and never merges it; blocked work must state the exact action needed. Use remind, list_reminders, and cancel_reminder for one-shot durable reminders. To wait for something external (CI, deploys), set a remind and end your turn; it will wake you. Don't sleep in bash.`;
 
 export const BUILTIN_DURABLE_PLAYBOOK = `# Durable Orchestrator Playbook
 

@@ -68,6 +68,16 @@ function createReminderTask(now: () => number, timer?: (deadline: number, signal
           });
           return { status: "terminal", outcome: { status: "completed", result: { id: item.id, fired: true } } };
         }, ctx);
+        const item = (await runtime.snapshot(ReminderState, task.conversationId, ctx))?.items[task.input.id];
+        if (item?.status === "fired") {
+          const conversation = await runtime.conversation(task.conversationId, ctx);
+          await conversation?.submit({
+            type: "input",
+            content: `⏰ Reminder: ${item.message}`,
+            whenBusy: "followUp",
+            requestId: `dpi-reminder:${item.id}`,
+          }, ctx);
+        }
       },
     },
     abort: async (task, runtime, ctx) => {
