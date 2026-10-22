@@ -1314,11 +1314,20 @@ export class Store {
     const key = this.submissionKey(row.id, c.id, input.requestId);
     return this.serializeSubmission(key, async () => {
       const existing = await h.commit((tx) => tx.submissionByRequest(c.id, input.requestId), ctx);
-      const content = existing || approvalHash || !this.onboardOptions
+      let content = existing || !this.onboardOptions
         ? input.content
         : expandSkillCommand(this.onboardOptions, input.content);
+      const approvals = this.opened.get(row.id)?.guardApprovals;
+      const approvalPending = !existing && approvalHash
+        ? approvals?.isPending(approvalHash, c.id) ?? false
+        : false;
+      if (!existing && approvalHash) {
+        content = `${input.content}\n\n${approvalPending
+          ? "Approval recorded for this exact command; re-run it once now."
+          : "This approval code is not pending (expired, already used, or the backend restarted). Re-run the exact command to get a fresh code."}`;
+      }
       const submission = await c.submit({ type: "input", ...input, content }, ctx);
-      if (!existing && approvalHash) this.opened.get(row.id)?.guardApprovals?.approve(approvalHash, c.id);
+      if (!existing && approvalHash && approvalPending) approvals?.approve(approvalHash, c.id);
       return submission;
     });
   }

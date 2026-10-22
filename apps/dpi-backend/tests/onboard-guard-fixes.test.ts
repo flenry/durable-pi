@@ -179,6 +179,12 @@ test("authenticated message route grants approvals once per newly accepted reque
 
       const acceptedApproval = await send(approvalText, "same-human-reply");
       assert.equal(acceptedApproval.response.status, 200);
+      assert.match(JSON.stringify(await entries()), /Approval recorded for this exact command; re-run it once now\./,
+        "the successful approval outcome is visible in the transcript");
+      const unknownApproval = await send(`approve ${"f".repeat(64)}`, "unknown-approval");
+      assert.equal(unknownApproval.response.status, 200);
+      assert.match(JSON.stringify(await entries()), /This approval code is not pending \(expired, already used, or the backend restarted\)\. Re-run the exact command to get a fresh code\./,
+        "an unknown approval outcome is visible in the transcript");
       const allowed = await send("run destructive probe", "destructive-allowed");
       assert.equal(allowed.response.status, 200);
       assert.equal(existsSync(target), false, "the accepted root approval authorizes one exact command");

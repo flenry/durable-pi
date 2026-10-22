@@ -10,7 +10,7 @@ import {
 import { ExpertIdentity } from "./experts.js";
 import { findDestructiveCommand, isAmbiguousTestScript, rewriteCommand } from "./guard-rules.js";
 
-const APPROVAL_TTL_MS = 10 * 60_000;
+const APPROVAL_TTL_MS = 24 * 60 * 60_000;
 const MAX_APPROVALS = 64;
 export const GUARD_BLOCKED_MARKER = "DPI_GUARD_BLOCKED:";
 
@@ -24,6 +24,8 @@ export const commandApprovalHash = commandHash;
 export interface GuardApprovalHost {
   /** Register an exact command that a human can approve from the root conversation. */
   request(command: string): string;
+  /** Check whether a root user message can grant this code without mutating approval state. */
+  isPending(hash: string, conversationId: ConversationId): boolean;
   /** Host-only write called by Store.send for a user message; non-root conversations cannot grant. */
   approve(hash: string, conversationId: ConversationId): boolean;
   /** Atomically consume a previously host-approved exact command, at most once. */
@@ -31,8 +33,9 @@ export interface GuardApprovalHost {
 }
 
 /**
- * Process-local, host-owned approvals. Restart drops pending/approved records, which is fail-closed; the model has no
- * tool for writing this map. A human must reply with the hash shown by the blocked tool result.
+ * Process-local, host-owned approvals. Pending requests expire after 24 hours and are pruned/capped; restart drops
+ * pending/approved records, which is fail-closed. The model has no tool for writing this map. A human must reply with
+ * the hash shown by the blocked tool result.
  */
 export function createGuardApprovalHost(options: { now?: () => number; ttlMs?: number } = {}): GuardApprovalHost {
   const now = options.now ?? Date.now;
@@ -50,6 +53,11 @@ export function createGuardApprovalHost(options: { now?: () => number; ttlMs?: n
       const hash = commandHash(command);
       if (!records.has(hash)) records.set(hash, { expiresAt: now() + ttlMs, approved: false });
       return hash;
+    },
+    isPending(hash, conversationId) {
+      prune();
+      if (conversationId !== ROOT_CONVERSATION_ID || !/^[a-f0-9]{64}$/i.test(hash)) return false;
+      return records.has(hash.toLowerCase());
     },
     approve(hash, conversationId) {
       prune();
@@ -78,7 +86,8 @@ export function commandApprovalFromUserMessage(content: string): string | undefi
 
 function blocked(label: string, reason: string, hash: string): string {
   return `${GUARD_BLOCKED_MARKER} Blocked destructive command (${label}): ${reason} ` +
-    `The user must reply exactly: approve ${hash}. Do not self-approve or change the command; then re-run it once. ` +
+    `The user must reply exactly: approve ${hash}. Do not self-approve or change the command. After the user approves, ` +
+    `re-run this exact command once, even if earlier attempts failed. ` +
     `Unattended ticket workers must stop and report TICKET_STATUS: BLOCKED: command needs approval (${label}).`;
 }
 

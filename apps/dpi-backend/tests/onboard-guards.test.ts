@@ -32,6 +32,23 @@ test("destructive guard matches plain-pi patterns including heredoc and echo tex
   }
 });
 
+test("approval remains usable when the human replies after the old ten-minute window", () => {
+  let now = 100;
+  const approvals = createGuardApprovalHost({ now: () => now });
+  const command = "rm -rf ./late-approval";
+  const hash = approvals.request(command);
+
+  now += 10 * 60_000 + 1;
+  assert.equal(approvals.approve(hash, ROOT_CONVERSATION_ID), true);
+  assert.equal(approvals.consume(command), true, "the exact re-run is authorized once");
+  assert.equal(approvals.consume(command), false, "the late approval remains one-shot");
+
+  const expiresAfterDay = approvals.request("git clean -fd");
+  now += 24 * 60 * 60_000;
+  assert.equal(approvals.approve(expiresAfterDay, ROOT_CONVERSATION_ID), false,
+    "pending approvals expire after 24 hours");
+});
+
 test("human command approvals are root-only, exact-command, expiring and one-shot", () => {
   let now = 100;
   const approvals = createGuardApprovalHost({ now: () => now, ttlMs: 1_000 });

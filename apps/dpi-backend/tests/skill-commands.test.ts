@@ -118,7 +118,8 @@ test("authenticated skill commands expand catalog entries once; API exposes the 
     await sendAndAssert(agent, "/brainstorm", "skill-command-prompt", brainstorm);
     const refreshedGrill = await loadedText(skillExtension, "grill");
     await sendAndAssert(agent, "/grill", "skill-command-no-args", refreshedGrill);
-    await sendAndAssert(agent, "approve "+"a".repeat(64), "skill-command-approve", "approve "+"a".repeat(64));
+    await sendAndAssert(agent, "approve "+"a".repeat(64), "skill-command-approve",
+      "approve "+"a".repeat(64)+"\n\nThis approval code is not pending (expired, already used, or the backend restarted). Re-run the exact command to get a fresh code.");
 
     await server.stop();
     server = undefined;
