@@ -41,6 +41,7 @@ import { createModels, type MutableModels } from "@earendil-works/pi-ai/models";
 import {
   fileCredentialStore,
   installSubscription,
+  isSubscriptionModel,
   isSubscriptionProvider,
   subscriptionDefault,
   subscriptionModels,
@@ -317,6 +318,14 @@ export class Store {
         getModels: () => catalog.filter((m) => curatedModels.some((c) => c.id === m.id)),
       });
     }
+    // A configured delegation model must resolve on this device. Never substitute another model:
+    // a silent fallback would run delegated workers on a model the operator did not choose.
+    const delegateModel = onboardOptions?.delegateModel;
+    if (delegateModel && !this.models.getModel(delegateModel.provider, delegateModel.modelId))
+      throw Error(
+        `DPI_DELEGATE_MODEL: ${delegateModel.provider}/${delegateModel.modelId} is not available on this device; ` +
+          `fix the value (must be provider/modelId installed here) or unset it. Delegation never substitutes a model.`,
+      );
     mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
     this.unlockCatalog = lockFile(`${this.catalogPath}.lock`);
     this.catalog = new DatabaseSync(this.catalogPath);
@@ -442,7 +451,9 @@ export class Store {
       return { provider: "faux", modelId: id };
     }
     if (this.options.provider === "subscription") {
-      if (model && isSubscriptionProvider(model.provider) && this.models.getModel(model.provider, model.modelId))
+      // Subscription models plus the pinned OpenRouter entry are kept exactly as requested: a
+      // delegated DeepSeek child must survive restart/recovery, not fall back to a subscription model.
+      if (model && isSubscriptionModel(model.provider, model.modelId) && this.models.getModel(model.provider, model.modelId))
         return { provider: model.provider, modelId: model.modelId };
       // A bare model id (e.g. the TUI passing info.defaultModel) resolves to whichever provider has it.
       const byId = model && this.modelList.find((m) => m.id === model.modelId);
@@ -461,7 +472,7 @@ export class Store {
       throw invalid("model must be { provider, modelId }");
     const known =
       this.options.provider === "subscription"
-        ? isSubscriptionProvider(m.provider) && !!this.models.getModel(m.provider, m.modelId)
+        ? isSubscriptionModel(m.provider, m.modelId) && !!this.models.getModel(m.provider, m.modelId)
         : this.options.provider === "faux"
         ? m.provider === "faux" && fauxModels.some((f) => f.id === m.modelId)
         : m.provider === "openrouter" &&

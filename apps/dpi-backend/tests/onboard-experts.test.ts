@@ -121,10 +121,19 @@ function expertHarnessApi(options: { taskId?: number; conversationId?: number; c
   return { api, state, tx };
 }
 
-function extensionForExperts(options: { maxChildren?: number; autoCloseConversation?: (id: number, key: string) => Promise<void> } = {}) {
+function extensionForExperts(options: {
+  maxChildren?: number;
+  autoCloseConversation?: (id: number, key: string) => Promise<void>;
+  delegateModel?: { provider: string; modelId: string };
+} = {}) {
   const client = fixtureClient();
   const children = ["coding-tools", "memory", "skills", "web"].map((name) => ({ name })) as never[];
-  return createExpertsExtension(client, { maxChildren: options.maxChildren ?? 2, childExtensions: children, autoCloseConversation: options.autoCloseConversation });
+  return createExpertsExtension(client, {
+    maxChildren: options.maxChildren ?? 2,
+    delegateModel: options.delegateModel,
+    childExtensions: children,
+    autoCloseConversation: options.autoCloseConversation,
+  });
 }
 
 async function invokeDelegate(
@@ -241,6 +250,23 @@ test("memory actor and self come from the trusted conversation identity, never t
     /trusted expert identity/,
   );
   assert.equal(calls.length, 3);
+});
+
+test("DPI_DELEGATE_MODEL runs delegate children on the configured model and keeps the expert's thinking level", async () => {
+  const deepseek = { provider: "openrouter", modelId: "deepseek/deepseek-v4.1-flash-1017" };
+  const delegate = extensionForExperts({ delegateModel: deepseek }).tools?.find((tool) => tool.name === "delegate");
+  assert.ok(delegate);
+  const fixture = expertHarnessApi();
+  await delegate.execute({ expert: "backend-engineer", task: "Implement the retry." } as never, fixture.api as never, context);
+
+  const childId = fixture.state.conversations[0].id;
+  const child = fixture.state.agents.get(childId)!;
+  // Configured delegation model wins; the expert fixture configures faux/echo.
+  assert.deepEqual(child.model, deepseek);
+  // Thinking level stays the expert's own (high), never borrowed from the override.
+  assert.equal(child.thinkingLevel, "high");
+  // The override never rewrites the root conversation's model.
+  assert.deepEqual([...fixture.state.agents.keys()], [childId]);
 });
 
 test("delegate creates a configured reviewer child with trusted identity and replay-safe ownership", async () => {

@@ -8,8 +8,11 @@
 //   DPI_MAX_CHILDREN    live delegate children allowed per session (default 2)
 //   DPI_TICKETS         1 enables the durable hourly ticket scheduler (default 0)
 //   DPI_AUTOCLOSE       0 disables automatic close of completed child agents (default 1 with onboarding)
+//   DPI_DELEGATE_MODEL  optional provider/modelId every delegated child (delegate + ticket slices) runs;
+//                       unset keeps each expert's own configured model
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { parseDelegateModel, type DelegatedModelRef } from "./delegate-model.js";
 
 export function onboardEnabledFromEnv(env = process.env): boolean {
   const enabled = env.DPI_ONBOARD ?? "0";
@@ -26,6 +29,8 @@ export interface OnboardOptions {
   maxChildren: number;
   ticketScheduler?: boolean;
   autoClose?: boolean;
+  /** Device-wide model for delegated children; unset means each expert's configured model. */
+  delegateModel?: DelegatedModelRef;
 }
 
 /** Skills that drive pi-only machinery (Herdr, worktree workers, pi's own handoff). */
@@ -59,5 +64,6 @@ export function onboardOptionsFromEnv(env = process.env): OnboardOptions {
     maxChildren,
     ticketScheduler: ticketFlag === "1",
     autoClose: autoCloseFlag === "1",
+    delegateModel: parseDelegateModel(env.DPI_DELEGATE_MODEL),
   };
 }

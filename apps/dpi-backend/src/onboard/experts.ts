@@ -22,6 +22,7 @@ import { THINKING_LEVELS } from "../../../dpi-sdk/src/api.js";
 import { messageText } from "../../../dpi-sdk/src/transcript.js";
 import type { MemoryClient } from "./memory-client.js";
 import { runBoundedProcess } from "./bounded-process.js";
+import { delegatedModel, type DelegatedModelRef } from "./delegate-model.js";
 
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const DEFAULT_GIT_MAX_OUTPUT_BYTES = 1_000_000;
@@ -84,6 +85,8 @@ interface ExpertConfiguration {
 
 interface ExpertExtensionOptions {
   maxChildren: number;
+  /** DPI_DELEGATE_MODEL: every delegate child runs this model; unset keeps the expert's model. */
+  delegateModel?: DelegatedModelRef;
   childExtensions: readonly Extension[];
   gitTimeoutMs?: number;
   maxGitOutputBytes?: number;
@@ -418,6 +421,8 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
       const repo = args.worktree ? await repositoryFor(parent.cwd, ctx, git) : undefined;
       const config = profileOf(await client.call<unknown>("expert", { name: args.expert }, ctx), args.expert);
       const resolvedModel = modelRef(config, args.expert);
+      // The expert's thinking level is kept; only the model is overridden.
+      const childModel = delegatedModel(undefined, options.delegateModel, resolvedModel.model);
       const excludedTools = [...new Set(config.profile.excludeTools)];
       const instructions = instructionsFor(config.profile);
 
@@ -431,7 +436,7 @@ export function createExpertsExtension(client: MemoryClient, options: ExpertExte
 
         const child = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
         const agent = await tx.doc(AgentDoc, child.id);
-        agent.model = resolvedModel.model;
+        agent.model = childModel;
         agent.thinkingLevel = resolvedModel.thinkingLevel;
         agent.extensions = extensionNames;
         agent.tools = removedTools(agent.tools, excludedTools);

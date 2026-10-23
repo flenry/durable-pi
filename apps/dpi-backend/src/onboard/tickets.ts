@@ -24,6 +24,7 @@ import type { WireMessage } from "../../../dpi-sdk/src/api.js";
 import { GUARD_BLOCKED_MARKER } from "./guards.js";
 import { runBoundedProcess, type BoundedProcessResult } from "./bounded-process.js";
 import { assertPristineWorktree, durableThinkingLevel, ExpertIdentity } from "./experts.js";
+import { delegatedModel, type DelegatedModelRef } from "./delegate-model.js";
 import { normalizeRemote } from "./project-key.js";
 import type { MemoryClient } from "./memory-client.js";
 import { createTicketSchedulerTask } from "./scheduler.js";
@@ -533,6 +534,8 @@ export interface TicketStateHost {
 export interface TicketExtensionOptions {
   device: string;
   childExtensionNames: readonly string[];
+  /** DPI_DELEGATE_MODEL: ticket-slice children are delegated workers too, so they get the same model. */
+  delegateModel?: DelegatedModelRef;
   memory: MemoryClient;
   process?: ProcessRunner;
   now?: () => number;
@@ -990,6 +993,12 @@ async function ensureTicketChild(
   if (slash < 1 || slash === modelId.length - 1) throw new Error(`Expert ${slice.expert} has an invalid model id`);
   const thinkingLevel = durableThinkingLevel(thinking);
   if (!thinkingLevel) throw new Error(`Expert ${slice.expert} has invalid thinking level ${thinking}`);
+  // The expert keeps its thinking level; only the model follows the device-wide delegation model.
+  const childModel = delegatedModel(
+    undefined,
+    options.delegateModel,
+    { provider: modelId.slice(0, slash), modelId: modelId.slice(slash + 1) },
+  );
   const denied = Array.isArray(profile.excludeTools) ? profile.excludeTools.filter((name): name is string => typeof name === "string") : [];
   let childId = 0;
   await runtime.commit(async (tx, current) => {
@@ -1001,7 +1010,7 @@ async function ensureTicketChild(
     const conversation = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
     childId = conversation.id as number;
     const agent = await tx.doc(AgentDoc, conversation.id);
-    agent.model = { provider: modelId.slice(0, slash), modelId: modelId.slice(slash + 1) };
+    agent.model = childModel;
     agent.thinkingLevel = thinkingLevel;
     agent.cwd = current.state.checkpoint.worktree ?? "";
     agent.extensions = childExtensionNames;

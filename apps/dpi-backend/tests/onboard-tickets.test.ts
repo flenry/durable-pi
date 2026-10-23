@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
+import { AgentDoc, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
+import { ExpertIdentity } from "../src/onboard/experts.js";
 import { parseReminderWhen } from "../src/onboard/remind.js";
 import { toMarkdown, toTranscript } from "../../dpi-sdk/src/transcript.js";
 import {
@@ -690,4 +691,86 @@ test("pull request body contains goal, criteria, and checks without any merge di
   assert.match(body, /pnpm test/);
   assert.match(body, /pnpm exec tsc --noEmit/);
   assert.doesNotMatch(body, /gh pr merge|merge this PR/i);
+});
+
+test("DPI_DELEGATE_MODEL applies to ticket-slice workers and keeps the expert's thinking level", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dpi-ticket-delegation-"));
+  try {
+    const worktree = join(root, "wt");
+    await mkdir(worktree, { recursive: true });
+    const current = ticket({
+      status: "in-progress",
+      runToken: "run-token",
+      runTaskId: 77,
+      worktree,
+      worktreeReady: true,
+      branch: "ticket/retry-login",
+    });
+    const state: Record<string, unknown> = {
+      [TICKETS_STATE_KEY]: { version: 1, tickets: { [current.id]: current }, processedHours: [] },
+    };
+    const agents = new Map<number, Record<string, unknown>>();
+    const extension = createTicketsExtension(
+      { transactTicketState: async (change) => change(state as never) },
+      {
+        device: current.device,
+        childExtensionNames: [],
+        delegateModel: { provider: "openrouter", modelId: "deepseek/deepseek-v4.1-flash-1017" },
+        memory: {
+          call: async <T>(command: string) =>
+            command === "expert"
+              ? ({ profile: { name: "backend-engineer", body: "# Role\nImplement the retry." }, model: { model: "faux/echo", thinking: "max" } } as T)
+              : ({ text: "" } as T),
+        },
+        nameConversation: () => {},
+      },
+    );
+    const runTask = extension.tasks?.[0] as never as { definition: { phases: { build: (...args: unknown[]) => Promise<void> } } };
+    const task = {
+      id: 77,
+      input: { ticketId: current.id, device: current.device, runToken: "run-token" },
+      state: {
+        checkpoint: {
+          phase: "build" as const,
+          sliceIndex: 0,
+          children: {},
+          attempts: {},
+          checks: [],
+          worktree,
+          branch: current.branch as string,
+        },
+      },
+    };
+    const tx = {
+      createConversation: async () => ({ id: 41 }),
+      doc: async (token: unknown, id: number) => {
+        if (token === AgentDoc) {
+          const agent = agents.get(id) ?? {};
+          agents.set(id, agent);
+          return agent;
+        }
+        if (token === ExpertIdentity) return {};
+        throw new Error("unexpected document");
+      },
+    };
+    const runtime = {
+      signal: new AbortController().signal,
+      commit: async (change: (transaction: typeof tx, current: unknown) => unknown) => change(tx, { state: task.state }),
+      conversation: async () => ({
+        submit: async () => ({ wait: async () => ({ status: "done", type: "input", answer: 900 }) }),
+      }),
+      context: async () => ({
+        entries: [{ id: 900, model: [{ role: "assistant", content: [{ type: "text", text: "TICKET_STATUS: COMPLETE" }] }] }],
+      }),
+    };
+    await runTask.definition.phases.build(task, runtime, BACKGROUND_CONTEXT);
+
+    const agent = agents.get(41);
+    assert.ok(agent, "ticket worker child was created");
+    assert.deepEqual(agent.model, { provider: "openrouter", modelId: "deepseek/deepseek-v4.1-flash-1017" });
+    assert.equal(agent.thinkingLevel, "xhigh"); // expert "max" maps to durable's xhigh
+    assert.equal(agents.size, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

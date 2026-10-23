@@ -31,11 +31,21 @@ With the repo's network config, `just net up local && just backend run` does the
 | `DPI_HOME` | `~/.dpi` | where `backend.env` is read (set by the service unit) |
 | `DPI_ENV_FILE` | `$DPI_HOME/backend.env` | the env file to read |
 | `DPI_PROVIDER` | `openrouter` | `faux` gives a free deterministic model for tests; `subscription` uses pi's Codex/Anthropic logins |
-| `DPI_SCOPED_MODELS` | all available subscription models | ordered comma-separated `provider/modelId` allowlist advertised to clients in subscription mode; unknown IDs fail startup, logged-out providers are omitted. Set it in the device YAML `env` to preserve it across `just net up`. This narrows pickers/cycling, not model access for existing sessions |
-| `OPENROUTER_API_KEY` | | model access, required unless `DPI_PROVIDER=faux`. Without it the device lists no models. Never sent to clients |
+| `DPI_SCOPED_MODELS` | all available subscription models | ordered comma-separated `provider/modelId` allowlist advertised to clients in subscription mode; unknown IDs fail startup, logged-out providers are omitted. It accepts the delegated model id (`openrouter/deepseek/deepseek-v4.1-flash-1017`) alongside subscription ids. Set it in the device YAML `env` to preserve it across `just net up`. This narrows pickers/cycling, not model access for existing sessions |
+| `DPI_DELEGATE_MODEL` | unset | optional `<provider>/<modelId>` that every worker delegated **inside durable** runs (`delegate` children and ticket-slice children), e.g. `openrouter/deepseek/deepseek-v4.1-flash-1017`. Unset keeps each expert's own configured model, so plain pi and its expert config are untouched. The root conversation's model never changes. A value that is not installed on the device fails startup instead of being substituted |
+| `OPENROUTER_API_KEY` | | model access in `openrouter` mode; in `subscription` mode it (or an `openrouter` api-key entry in `DPI_AUTH_FILE`) is required only for the pinned DeepSeek model, which is not advertised without it. Without it `openrouter` devices list no models. Never sent to clients |
 | `TYPESAFE_API_KEY` | | optional: `jev-damage-control` asks Jev with it, else through OpenRouter |
 
 Flags `--port`, `--host`, `--name`, `--start-dirs`, `--data-dir` and `--env-file` override the env.
+
+### Delegated workers on DeepSeek (subscription devices)
+
+`subscription` mode lists the models of the Codex/Anthropic logins plus exactly one OpenRouter model, `deepseek/deepseek-v4.1-flash-1017` (catalog backport in `src/subscription-models.ts`; a future pi-ai native entry wins). Two independent switches decide what happens:
+
+1. **Picker/selection** — the DeepSeek entry appears next to the subscription models when the device has OpenRouter credentials, and only when its id is inside `DPI_SCOPED_MODELS` if that allowlist is set. Selecting it for a session works like any other model and never substitutes a different one.
+2. **Delegated workers** — set `DPI_DELEGATE_MODEL=openrouter/deepseek/deepseek-v4.1-flash-1017` to run every `delegate` child and ticket-slice child on DeepSeek. Thinking levels still come from each expert's configuration (`max` maps to durable's `xhigh`). An explicit per-child model, if a tool ever passes one, wins over `DPI_DELEGATE_MODEL`, which wins over the expert's configured model. The root conversation keeps whatever model the user chose.
+
+Without OpenRouter credentials the model is not advertised and a request for it fails with the provider's auth error: durable never silently falls back to a subscription model. `openrouter` mode is unchanged and still uses its curated catalog.
 
 ## Deploy to other devices
 

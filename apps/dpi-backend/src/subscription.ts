@@ -8,17 +8,30 @@ import { dirname, join } from "node:path";
 import type { CreateModelsOptions, MutableModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import type { ModelInfo } from "../../dpi-sdk/src/api.js";
-import { HAIKU_5_5 } from "./subscription-models.js";
+import { DEEPSEEK_V4_1_FLASH_1017, HAIKU_5_5 } from "./subscription-models.js";
 
 export const SUBSCRIPTION_PROVIDERS = ["openai-codex", "anthropic"] as const;
 export type SubscriptionProvider = (typeof SUBSCRIPTION_PROVIDERS)[number];
 export const DEFAULT_AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 export const DEFAULT_SUBSCRIPTION_MODEL = { provider: "openai-codex", modelId: "gpt-6.1-sol" } as const;
 const ICONS: Record<SubscriptionProvider, string> = { "openai-codex": "openai.png", anthropic: "anthropic.png" };
+/** The only OpenRouter model subscription mode installs: delegated workers default to it. */
+export const SUBSCRIPTION_OPENROUTER_MODELS = [DEEPSEEK_V4_1_FLASH_1017] as const;
+const TIERS: Record<SubscriptionProvider | "openrouter", ModelInfo["tier"]> = {
+  "openai-codex": "S",
+  anthropic: "S",
+  openrouter: "A",
+};
 
 export const isSubscriptionProvider = (p: string): p is SubscriptionProvider =>
   (SUBSCRIPTION_PROVIDERS as readonly string[]).includes(p);
+
+/** Models subscription mode runs: its OAuth providers plus the pinned OpenRouter DeepSeek entry. */
+export const isSubscriptionModel = (provider: string, modelId: string): boolean =>
+  isSubscriptionProvider(provider) ||
+  (provider === "openrouter" && SUBSCRIPTION_OPENROUTER_MODELS.some((m) => m.id === modelId));
 
 // pi-ai exports the credential store contract only through CreateModelsOptions.
 type CredentialStore = NonNullable<CreateModelsOptions["credentials"]>;
@@ -93,7 +106,17 @@ export function fileCredentialStore(file = DEFAULT_AUTH_FILE): CredentialStore {
   return store;
 }
 
-/** Register the subscription providers on a Models registry created with fileCredentialStore. */
+/**
+ * Register the subscription providers on a Models registry created with fileCredentialStore.
+ *
+ * Subscription mode also installs the built-in OpenRouter provider, narrowed to
+ * SUBSCRIPTION_OPENROUTER_MODELS: delegated children can then run the pinned DeepSeek model on
+ * the same device without changing the root agent's model, while the picker keeps listing exactly
+ * the subscription models plus that one entry. Credentials stay OpenRouter's own
+ * (OPENROUTER_API_KEY or an api_key entry in the shared auth.json): when they are missing the model
+ * is simply not advertised, and asking for it fails with the provider's auth error instead of
+ * silently running another model.
+ */
 export function installSubscription(models: MutableModels): void {
   models.setProvider(openaiCodexProvider());
   const anthropic = anthropicProvider();
@@ -104,6 +127,11 @@ export function installSubscription(models: MutableModels): void {
     anthropic.getAllModels = () => [...all, HAIKU_5_5];
   }
   models.setProvider(anthropic);
+  const openrouter = openrouterProvider();
+  const catalog = openrouter.getModels();
+  // Prefer the runtime's native entry when a future pi-ai ships this model; otherwise the backport.
+  const installed = SUBSCRIPTION_OPENROUTER_MODELS.map((fallback) => catalog.find((m) => m.id === fallback.id) ?? fallback);
+  models.setProvider({ ...openrouter, getModels: () => installed, getAllModels: () => installed });
 }
 
 /** Authenticated models advertised to clients; optional scope is ordered provider/modelId CSV. */
@@ -114,19 +142,19 @@ export async function subscriptionModels(models: MutableModels, env = process.en
   for (const id of scope ?? []) {
     const slash = id.indexOf("/");
     const provider = id.slice(0, slash);
-    if (slash < 1 || !isSubscriptionProvider(provider) || !models.getModel(provider, id.slice(slash + 1)))
-      throw Error(`DPI_SCOPED_MODELS: unknown subscription model ${id}; use provider/modelId`);
+    if (slash < 1 || !isSubscriptionModel(provider, id.slice(slash + 1)) || !models.getModel(provider, id.slice(slash + 1)))
+      throw Error(`DPI_SCOPED_MODELS: unknown subscription or delegated model ${id}; use provider/modelId`);
   }
   const out: ModelInfo[] = [];
-  for (const provider of SUBSCRIPTION_PROVIDERS) {
+  for (const provider of [...SUBSCRIPTION_PROVIDERS, "openrouter"] as const) {
     const available = await models.getAvailable(provider, { signal: AbortSignal.timeout(10_000) });
     for (const m of available)
       out.push({
         id: m.id,
         provider,
         name: m.name,
-        tier: "S",
-        icon: ICONS[provider],
+        tier: TIERS[provider],
+        icon: provider === "openrouter" ? "deepseek.png" : ICONS[provider],
         contextWindow: m.contextWindow,
         reasoning: m.reasoning,
         cost: { input: m.cost.input, output: m.cost.output },

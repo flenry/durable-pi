@@ -33,3 +33,32 @@ export const HAIKU_5_5: Model<"anthropic-messages"> = {
   },
   type: "chat",
 };
+
+// Catalog-only backport from @earendil-works/pi-ai 1.2.0, providers/data/openrouter.json.
+// Metadata verified against the installed pi catalog (models-store.json) on 2026-10-23; the
+// 1.0.3 runtime ships deepseek/deepseek-v4.1-flash but not this dated snapshot. Keep the
+// existing 1.0.3 runtime; prefer the native entry once it includes this model.
+export const DEEPSEEK_V4_1_FLASH_1017: Model<"openai-completions"> = {
+  id: "deepseek/deepseek-v4.1-flash-1017",
+  name: "DeepSeek V4.1 Flash 1017",
+  api: "openai-completions",
+  provider: "openrouter",
+  baseUrl: "https://openrouter.ai/api/v1",
+  reasoning: true,
+  thinkingLevelMap: { off: "none", minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
+  input: ["text", "image"],
+  cost: { input: 0.07, output: 0.5, cacheRead: 0.008, cacheWrite: 0 },
+  contextWindow: 1048576,
+  maxTokens: 943718,
+  compat: {
+    supportsDeveloperRole: false,
+    thinkingFormat: "openrouter",
+    supportsStrictMode: true,
+    sendSessionAffinityHeaders: true,
+    requiresReasoningContentOnAssistantMessages: true,
+  },
+  inputLimits: {
+    images: { resize: { maxWidth: 2000, maxHeight: 2000, maxBytes: 4718592, jpegQuality: 80 } },
+  },
+  type: "chat",
+};

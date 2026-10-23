@@ -4,6 +4,7 @@
 import { existsSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
+import { parseDelegateModel } from "./onboard/delegate-model.js";
 
 export interface BackendConfig {
   name: string;
@@ -54,6 +55,9 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): Bac
   };
   if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535)
     throw Error(`Invalid port: ${config.port}`);
+  // Fail fast on a malformed delegation model even when onboarding (the only consumer) is off.
+  // Whether the model exists on this device is checked once the model registry is built.
+  parseDelegateModel(env.DPI_DELEGATE_MODEL);
   if (config.token.length < 32)
     throw Error(
       `DPI_TOKEN is missing or shorter than 32 characters (looked in ${envFile}). Create one with: npm run token`,

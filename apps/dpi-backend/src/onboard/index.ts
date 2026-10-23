@@ -38,12 +38,14 @@ export function installOnboard(registry: Registry, options: OnboardOptions, cont
     createPlaybookExtension(options.setupDir),
     createExpertsExtension(client, {
       maxChildren: options.maxChildren,
+      delegateModel: options.delegateModel,
       childExtensions: [...context.childBaseExtensions, context.guards, memory, skills, web],
       nameConversation: context.nameConversation,
       autoCloseConversation: context.autoCloseConversation,
     }),
     createTicketsExtension(context.shared, {
       device: context.device,
+      delegateModel: options.delegateModel,
       childExtensionNames: [...context.childBaseExtensions, context.guards, memory, skills, web].map((extension) => extension.name),
       memory: client,
       schedulerEnabled: options.ticketScheduler,
