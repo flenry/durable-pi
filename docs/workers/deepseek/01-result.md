@@ -41,7 +41,7 @@ Covered behaviours: catalog entry installed and nothing else; picker shows the e
 
 ## Commit
 
-`feat: expose deepseek to delegated workers` on branch `deepseek-model` (worktree `/Users/ced/personal/durable-pi-deepseek`), based on `696d648`.
+`76efb11 feat: expose deepseek to delegated workers` on branch `deepseek-model` (worktree `/Users/ced/personal/durable-pi-deepseek`), based on `696d648`. The commit that records this result file is doc-only and follows it. Final re-verification after that commit: `tsc --noEmit -p .` clean, full suite 143/143 pass at concurrency 2.
 
 Local-only install artifacts, deliberately **not** committed (delete if unwanted): `apps/dpi-backend/pnpm-lock.yaml`, `apps/dpi-backend/pnpm-workspace.yaml` (pnpm 11 wrote `allowBuilds` placeholders for `@google/genai`, `esbuild`, `protobufjs`; ignored build scripts do not affect tsx/tsc). `apps/dpi-backend/package-lock.json` and `docs/architecture.html` were not touched.
 
