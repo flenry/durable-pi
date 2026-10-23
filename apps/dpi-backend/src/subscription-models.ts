@@ -34,10 +34,14 @@ export const HAIKU_5_5: Model<"anthropic-messages"> = {
   type: "chat",
 };
 
-// Catalog-only backport from @earendil-works/pi-ai 1.2.0, providers/data/openrouter.json.
-// Metadata verified against the installed pi catalog (models-store.json) on 2026-10-23; the
-// 1.0.3 runtime ships deepseek/deepseek-v4.1-flash but not this dated snapshot. Keep the
-// existing 1.0.3 runtime; prefer the native entry once it includes this model.
+// Catalog-only backport, copied field-for-field from the installed plain-pi catalog:
+//   @earendil-works/pi-ai 1.4.0 (shipped with @earendil-works/pi-coding-agent 1.4.0),
+//   dist/providers/data/openrouter.json, key "chat:deepseek/deepseek-v4.1-flash-1017",
+//   inspected 2026-10-23.
+// The pinned 1.0.3 runtime ships deepseek/deepseek-v4.1-flash but not this dated snapshot, and its
+// catalog is older: these values are the current ones, and they control the outgoing request, not
+// just the picker (pi-ai defaults `maxTokens` to `model.maxTokens`). Keep the 1.0.3 runtime; prefer
+// the native entry once it includes this model.
 export const DEEPSEEK_V4_1_FLASH_1017: Model<"openai-completions"> = {
   id: "deepseek/deepseek-v4.1-flash-1017",
   name: "DeepSeek V4.1 Flash 1017",
@@ -47,9 +51,9 @@ export const DEEPSEEK_V4_1_FLASH_1017: Model<"openai-completions"> = {
   reasoning: true,
   thinkingLevelMap: { off: "none", minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
   input: ["text", "image"],
-  cost: { input: 0.07, output: 0.5, cacheRead: 0.008, cacheWrite: 0 },
+  cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
   contextWindow: 1048576,
-  maxTokens: 943718,
+  maxTokens: 393216,
   compat: {
     supportsDeveloperRole: false,
     thinkingFormat: "openrouter",

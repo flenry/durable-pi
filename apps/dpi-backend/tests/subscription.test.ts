@@ -1,10 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../src/config.js";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { CreateModelsOptions } from "@earendil-works/pi-ai/models";
 import { createModels } from "@earendil-works/pi-ai/models";
+import { loadConfig } from "../src/config.js";
 import {
   fileCredentialStore,
   installSubscription,
@@ -23,6 +25,47 @@ function catalog() {
   installSubscription(models);
   // Offline catalog availability: never use real logins or call a model.
   models.getAvailable = async (provider?: string) => models.getModels(provider);
+  return models;
+}
+
+// Real credential resolution, synthetic inputs: the production `createModels` auth path (credential
+// store + auth context) with no personal logins, files or network.
+type CredentialStore = NonNullable<CreateModelsOptions["credentials"]>;
+type StoredCredential = Awaited<ReturnType<CredentialStore["read"]>>;
+
+function syntheticCredentialStore(records: Record<string, { type: "api_key"; key: string }> = {}): CredentialStore {
+  const all = new Map<string, StoredCredential>(Object.entries(records));
+  return {
+    async read(providerId) {
+      return all.get(providerId);
+    },
+    async list() {
+      return [...all.entries()].map(([providerId, credential]) => ({ providerId, type: credential!.type }));
+    },
+    async modify(providerId, fn) {
+      const next = await fn(all.get(providerId));
+      if (next === undefined) all.delete(providerId);
+      else all.set(providerId, next);
+      return next;
+    },
+    async delete(providerId) {
+      all.delete(providerId);
+    },
+  };
+}
+
+/** Synthetic process environment for pi-ai's auth context: no personal env, no file probing. */
+const syntheticEnv = (env: Record<string, string> = {}) => ({
+  env: async (name: string) => env[name],
+  fileExists: async () => false,
+});
+
+function authenticatedCatalog(
+  credentials: CredentialStore = syntheticCredentialStore(),
+  env: Record<string, string> = {},
+) {
+  const models = createModels({ credentials, authContext: syntheticEnv(env) });
+  installSubscription(models);
   return models;
 }
 
@@ -64,8 +107,9 @@ test("subscription mode installs exactly the pinned OpenRouter DeepSeek entry", 
   assert.equal(deepseek.api, "openai-completions");
   assert.equal(deepseek.reasoning, true);
   assert.equal(deepseek.contextWindow, 1_048_576);
-  assert.equal(deepseek.maxTokens, 943_718);
-  assert.deepEqual(deepseek.cost, { input: 0.07, output: 0.5, cacheRead: 0.008, cacheWrite: 0 });
+  // Reconciled with the installed plain-pi catalog (@earendil-works/pi-ai 1.4.0, inspected 2026-10-23).
+  assert.equal(deepseek.maxTokens, 393_216);
+  assert.deepEqual(deepseek.cost, { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 });
   assert.deepEqual(deepseek.input, ["text", "image"]);
 });
 
@@ -212,4 +256,131 @@ test("default subscription model is overridable as provider/modelId", () => {
     modelId: "claude-opus-5-5",
   });
   assert.throws(() => subscriptionDefault({ DPI_DEFAULT_MODEL: "openrouter/x" }), /DPI_DEFAULT_MODEL/);
+});
+
+test("real auth resolution advertises DeepSeek only when a synthetic OpenRouter credential resolves", async () => {
+  // Missing credential: the real getAvailable/getAuth path reports nothing and lists nothing.
+  const missing = authenticatedCatalog();
+  assert.deepEqual(await missing.getAvailable("openrouter"), []);
+  assert.equal(await missing.getAuth("openrouter"), undefined);
+  assert.equal((await subscriptionModels(missing, {})).some((m) => m.provider === "openrouter"), false);
+  // The subscription models stay unknown too, so the device lists exactly nothing here.
+  assert.deepEqual(await missing.getAvailable("anthropic"), []);
+
+  // Environment credential: same path, synthetic OPENROUTER_API_KEY only.
+  const viaEnv = authenticatedCatalog(syntheticCredentialStore(), { OPENROUTER_API_KEY: "sk-or-synthetic-env" });
+  assert.deepEqual((await viaEnv.getAvailable("openrouter")).map((m) => m.id), [DEEPSEEK]);
+  const envAuth = await viaEnv.getAuth("openrouter");
+  assert.equal(envAuth?.auth.apiKey, "sk-or-synthetic-env");
+  assert.deepEqual((await subscriptionModels(viaEnv, {})).filter((m) => m.provider === "openrouter").map((m) => m.id), [DEEPSEEK]);
+
+  // Stored credential: a synthetic api_key in the plain pi auth.json shape.
+  const viaStore = authenticatedCatalog(
+    syntheticCredentialStore({ openrouter: { type: "api_key", key: "sk-or-synthetic-stored" } }),
+  );
+  assert.deepEqual((await viaStore.getAvailable("openrouter")).map((m) => m.id), [DEEPSEEK]);
+  const storeAuth = await viaStore.getAuth("openrouter");
+  assert.equal(storeAuth?.auth.apiKey, "sk-or-synthetic-stored");
+  assert.notEqual(storeAuth?.source, envAuth?.source);
+});
+
+test("an OpenRouter discovery failure surfaces instead of silently dropping the delegated model", async () => {
+  const models = catalog();
+  models.getAvailable = async (provider?: string) => {
+    if (provider === "openrouter") throw new Error("openrouter catalog offline");
+    return models.getModels(provider);
+  };
+  // Documented policy: a failing optional provider fails the listing (and therefore startup) loudly;
+  // nothing is swallowed and no other model is substituted.
+  await assert.rejects(subscriptionModels(models, {}), /openrouter catalog offline/);
+});
+
+test("the emitted OpenRouter request carries the exact DeepSeek id and the reconciled output cap", async () => {
+  const models = authenticatedCatalog(syntheticCredentialStore(), { OPENROUTER_API_KEY: "sk-or-synthetic-env" });
+  const deepseek = models.getModel("openrouter", DEEPSEEK);
+  assert.ok(deepseek);
+
+  let captured: { url: string; body: Record<string, unknown> } | undefined;
+  const stream = models.streamSimple(
+    deepseek,
+    { messages: [{ role: "user", timestamp: Date.now(), content: [{ type: "text", text: "ping" }] }] },
+    {
+      reasoning: "xhigh",
+      fetch: async (input: string | URL | Request, init?: RequestInit) => {
+        captured = { url: String(input instanceof Request ? input.url : input), body: JSON.parse(String(init?.body ?? "{}")) };
+        throw new Error("offline test transport");
+      },
+    } as never,
+  );
+  try {
+    for await (const _ of stream) {
+      // Drain until the injected transport fails; only the outgoing request matters here.
+    }
+  } catch {
+    // A failed offline request is expected.
+  }
+
+  assert.ok(captured, "the provider dispatched a request");
+  assert.match(captured.url, /^https:\/\/openrouter\.ai\/api\/v1\/chat\/completions/);
+  assert.equal(captured.body.model, DEEPSEEK);
+  // The pinned runtime defaults the request cap to model.maxTokens, so the backport value is operational.
+  // OpenRouter dispatches through openai-completions with max_completion_tokens.
+  assert.equal(captured.body.max_completion_tokens, 393_216);
+  assert.equal(captured.body.max_tokens, undefined);
+  // durable xhigh clamps to the vendor-supported max, as the catalog declares (xhigh: null).
+  assert.deepEqual(captured.body.reasoning, { effort: "max" });
+});
+
+test("a persisted subscription device keeps the DeepSeek child and its unchanged Codex root across reopen", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dpi-sub-reopen-"));
+  const work = join(root, "work");
+  mkdirSync(work, { recursive: true });
+  const authFile = join(root, "auth.json");
+  writeFileSync(authFile, "{}");
+  const options = {
+    dataDir: join(root, "data"),
+    startDirs: [work],
+    name: "test",
+    provider: "subscription" as const,
+    authFile,
+  };
+  const deepseek = { provider: "openrouter", modelId: DEEPSEEK };
+  let sessionId = "";
+  let childId = 0;
+  try {
+    const store = await Store.open(options);
+    try {
+      const summary = await store.create({ name: "reopen", cwd: work, model: { provider: "openai-codex", modelId: "gpt-6.1-sol" } });
+      sessionId = summary.id;
+      const row = store.list().find((entry) => entry.id === sessionId);
+      assert.ok(row);
+      const harness = await store.openAgent(row);
+      const child = await harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: deepseek } }, BACKGROUND_CONTEXT);
+      childId = Number(child.id);
+      assert.deepEqual((await child.agent(BACKGROUND_CONTEXT)).model, deepseek);
+    } finally {
+      await store.close();
+    }
+
+    const reopened = await Store.open(options);
+    try {
+      const row = reopened.list().find((entry) => entry.id === sessionId);
+      assert.ok(row);
+      assert.equal(row.provider, "openai-codex");
+      assert.equal(row.model, "gpt-6.1-sol");
+      const harness = await reopened.openAgent(row);
+      const rootConversation = await harness.root(BACKGROUND_CONTEXT);
+      assert.deepEqual((await rootConversation.agent(BACKGROUND_CONTEXT)).model, {
+        provider: "openai-codex",
+        modelId: "gpt-6.1-sol",
+      });
+      const child = await harness.conversation(childId as never, BACKGROUND_CONTEXT);
+      assert.ok(child, "the child conversation was recovered");
+      assert.deepEqual((await child.agent(BACKGROUND_CONTEXT)).model, deepseek);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

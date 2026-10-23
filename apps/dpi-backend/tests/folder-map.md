@@ -1,5 +1,5 @@
 # Backend tests
-- `subscription.test.ts`: credential persistence, Haiku/DeepSeek catalog, ordered model scope, subscription routing of the delegated model (offline).
+- `subscription.test.ts`: credential persistence, Haiku/DeepSeek catalog and order/scope, real `getAvailable`/`getAuth` with synthetic credentials (missing/env/store), injected-transport request assertion, subscription routing of the delegated model and a persisted Store close/reopen child+root check (offline).
 - `delegate-model.test.ts`: `DPI_DELEGATE_MODEL` parsing, loud failures on unusable values, and delegation model precedence.
 - `api.test.ts` / `streams.test.ts`: REST contract and streaming behavior.
 - `store.test.ts` / `recovery.test.ts`: agent features and checkpoint recovery after SIGKILL.
