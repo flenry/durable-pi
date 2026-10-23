@@ -14,7 +14,7 @@ Status: implemented, verified locally, committed. No push, no deploy, no credent
 
 ## Changes (all inside `apps/dpi-backend`, plus this doc)
 
-1. `src/subscription-models.ts` — added `DEEPSEEK_V4_1_FLASH_1017`, a catalog-only backport (same pattern as the existing `HAIKU_5_5`). Metadata transcribed from the installed plain-pi catalog: cost 0.07 / 0.5 / cacheRead 0.008, context 1 048 576, maxTokens 943 718, reasoning, `openai-completions`, `thinkingLevelMap` with `max: "max"`. No dependency bump; the native entry wins automatically if a future pi-ai ships it.
+1. `src/subscription-models.ts` — added `DEEPSEEK_V4_1_FLASH_1017`, a catalog-only backport (same pattern as the existing `HAIKU_5_5`). Metadata is copied field-for-field from the currently installed plain-pi catalog: `@earendil-works/pi-ai` **1.4.0**, `dist/providers/data/openrouter.json`, key `chat:deepseek/deepseek-v4.1-flash-1017`, inspected 2026-10-23 — cost **0.15 / 0.6 / cacheRead 0.003**, context 1 048 576, maxTokens **393 216**, reasoning, `openai-completions`, `thinkingLevelMap` with `max: "max"`. (An earlier draft of this result cited the older 1.2.0 values 0.07/0.5/0.008 and 943 718; review F1 showed the emitted request cap comes from these values, and they are now reconciled and asserted at request level.) No dependency bump; the native entry wins automatically if a future pi-ai ships it.
 2. `src/subscription.ts` — `installSubscription` also registers `openrouterProvider()` narrowed to exactly that one entry (`SUBSCRIPTION_OPENROUTER_MODELS`), even if the vendor catalog later grows. New `isSubscriptionModel(provider, modelId)` is the single predicate for "runnable in subscription mode". `subscriptionModels` lists subscription providers plus the deepseek entry (`tier A`, `icon deepseek.png`) and accepts `openrouter/deepseek/deepseek-v4.1-flash-1017` in `DPI_SCOPED_MODELS`; other OpenRouter ids still fail. `subscriptionDefault` is unchanged.
 3. `src/store.ts` — subscription `routedModel`/`validateModel` accept the pinned OpenRouter model through `isSubscriptionModel` and keep it verbatim through recovery (no fallback to a subscription model). Startup now rejects a configured delegation model that this device cannot resolve: `DPI_DELEGATE_MODEL: <provider>/<modelId> is not available on this device; ... Delegation never substitutes a model.`
 4. `src/onboard/delegate-model.ts` (new) — `parseDelegateModel()` for `<provider>/<modelId>` (model ids may contain slashes) and `delegatedModel()` precedence: **explicit per-child model > `DPI_DELEGATE_MODEL` > expert config**. No tool passes an explicit per-child model today; the parameter exists so the order is documented and tested when one is added.
@@ -35,7 +35,7 @@ Run from `apps/dpi-backend`, with `PI_GUARDS_PARITY_DIR=/Users/ced/.pi/agent/ext
 | `./node_modules/.bin/tsc --noEmit -p .` | clean (strict) |
 | `tsx --test --test-concurrency=2 tests/subscription.test.ts tests/delegate-model.test.ts` | 19/19 pass |
 | `tsx --test --test-concurrency=2 tests/onboard-experts.test.ts tests/onboard-tickets.test.ts` | 36/36 pass |
-| `tsx --test --test-concurrency=2 tests/*.test.ts` | **143 pass, 0 fail** (baseline before the change: 130 pass) |
+| `tsx --test --test-concurrency=2 tests/*.test.ts` | **147 pass, 0 fail** after the review fix (143 before it; baseline before the whole change: 130 pass) |
 
 Covered behaviours: catalog entry installed and nothing else; picker shows the entry with credentials and omits it without them while the subscription list is unchanged; scope accepts the deepseek id and rejects other OpenRouter ids; a subscription device routes/validates the delegated model unchanged and rejects uninstalled ids; device `defaultModel` stays `gpt-6.1-sol`; unknown-in-device `DPI_DELEGATE_MODEL` fails startup; malformed value fails startup; precedence explicit > configured > expert; delegate child gets the configured model with the expert's thinking level and the root agent doc is untouched; ticket-slice child does the same.
 
@@ -70,8 +70,12 @@ Applies to the subscription devices (the VM and Home). OpenRouter mode devices a
 
 - Credentials on both devices remain unverified (no secret access); step 1 is the only safe check.
 - `DPI_DELEGATE_MODEL` only affects onboarding delegation. If the parent wants durable-wide adoption it must be in each device's env; nothing is on by default.
-- Expert thinking levels `max` map to durable `xhigh`, and the DeepSeek catalog entry declares `xhigh: null`, so pi's thinking-level clamping may send the nearest supported level (`max`) at request time. This is pre-existing vendor-capability behaviour, not a durable substitution.
+- Expert thinking levels `max` map to durable `xhigh`, and the DeepSeek catalog entry declares `xhigh: null`, so the runtime clamps to `max`. The review fix now asserts this in the emitted request (`reasoning: { effort: "max" }`); it is vendor-capability behaviour, not a durable substitution.
 - `justfile` / root `README` / `.claude/commands/install.md` still document `npm install`; outside the owned paths, unchanged. I installed with pnpm per the task.
+
+## Review fix (docs/workers/deepseek/02-review-result.md)
+
+F1 (blocking metadata) and F2 (test fidelity) are fixed in `docs/workers/deepseek/03-fix-result.md`: output cap 393 216 and prices 0.15/0.6/0.003 from the installed pi-ai 1.4.0 catalog, a real injected-transport request regression (exact model id, cap, clamped reasoning), real synthetic-credential `getAvailable`/`getAuth` coverage (missing/env/store), and a real persisted Store close/reopen child+root regression.
 
 ## Learnings
 
